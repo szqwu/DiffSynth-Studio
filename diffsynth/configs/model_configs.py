@@ -294,6 +294,27 @@ wan_series = [
         "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 48, 'dim': 3072, 'ffn_dim': 14336, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 48, 'num_heads': 24, 'num_layers': 30, 'eps': 1e-06, 'seperated_timestep': True, 'require_clip_embedding': False, 'require_vae_embedding': False, 'fuse_vae_embedding_in_latents': True}
     },
     {
+        # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors")
+        "model_hash": "TBD",
+        "model_name": "wan_video_dit",
+        "model_class": "diffsynth.models.wan_video_dit.WanModel",
+        "extra_kwargs": {'has_image_input': False, 
+            'patch_size': [1, 2, 2], 
+            'in_dim': 48, 
+            'dim': 3072, 
+            'ffn_dim': 14336, 
+            'freq_dim': 256, 
+            'text_dim': 4096, 
+            'out_dim': 48, 
+            'num_heads': 24, 
+            'num_layers': 30, 
+            'eps': 1e-06, 
+            'seperated_timestep': True, 
+            'require_clip_embedding': False, 
+            'require_vae_embedding': False, 
+            'fuse_vae_embedding_in_latents': True}
+    },
+    {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth")
         "model_hash": "e1de6c02cdac79f8b739f4d3698cd216",
         "model_name": "wan_video_vae",

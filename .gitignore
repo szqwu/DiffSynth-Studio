@@ -8,6 +8,8 @@
 *.ckpt
 *.pt
 *.bin
+*.binary
+*.msgpack
 *.DS_Store
 *.msc
 *.mv
