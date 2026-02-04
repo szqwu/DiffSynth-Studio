@@ -494,7 +494,7 @@ class my_cognvs_dataset(Dataset):
             time_division_factor=self.time_division_factor, 
             time_division_remainder=self.time_division_remainder
         )(input_video_path)
-        print(f"input_video_frames: {len(input_video_frames)}")
+        # print(f"input_video_frames: {len(input_video_frames)}")
         # target_video_frames = self.read_video_frames(target_video_path)
         target_video_frames = input_video_frames.copy()
 

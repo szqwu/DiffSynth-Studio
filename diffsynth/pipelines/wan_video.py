@@ -58,6 +58,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_PromptEmbedder(),
             WanVideoUnit_S2V(),
             WanVideoUnit_InputVideoEmbedder(),
+            WanVideoUnit_InputVideoEmbedderMultiple(),
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
@@ -362,6 +363,7 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
         # If num_latent_frames is specified (for separate encoding), use it directly
         # Otherwise, calculate from num_frames (for normal video encoding with temporal compression)
         if num_latent_frames is not None:
+            print(f"num_latent_frames: {num_latent_frames}")
             length = num_latent_frames
         else:
             length = (num_frames - 1) // 4 + 1
@@ -385,7 +387,7 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
         )
 
     def process(self, pipe: WanVideoPipeline, input_video, noise, tiled, tile_size, tile_stride, vace_reference_image):
-        if input_video is None or not pipe.dit.fuse_vae_embedding_in_latents_multiple:
+        if input_video is None or pipe.dit.fuse_vae_embedding_in_latents_multiple:
             return {"latents": noise}
         pipe.load_models_to_device(self.onload_model_names)
         input_video = pipe.preprocess_video(input_video)
@@ -1292,6 +1294,7 @@ def model_fn_wan_video(
             t = t_chunks[get_sequence_parallel_rank()]
         t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
     elif dit.seperated_timestep and fuse_vae_embedding_in_latents and dit.fuse_vae_embedding_in_latents_multiple:
+        print(latents.dtype)
         timestep = torch.concat([
             torch.zeros((5, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
             torch.ones((latents.shape[2] - 5, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
@@ -1330,6 +1333,7 @@ def model_fn_wan_video(
         context = torch.cat([clip_embdding, context], dim=1)
     if raymap is not None and dit.fuse_vae_embedding_in_latents_multiple:
         x = torch.cat([x, raymap], dim=1)
+        print(f"x.shape: {x.shape}")
         
     # Camera control
     x = dit.patchify(x, control_camera_latents_input)
