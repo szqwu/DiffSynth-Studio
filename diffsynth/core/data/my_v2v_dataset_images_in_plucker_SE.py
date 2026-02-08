@@ -390,29 +390,37 @@ class my_cognvs_dataset(Dataset):
     
     def scale_intrinsics(self, fx, fy, cx, cy, orig_width, orig_height, target_width, target_height):
         """
-        Scale camera intrinsics to target resolution
+        Scale camera intrinsics to target resolution, accounting for resize + center crop.
+        The image processing pipeline first resizes the image uniformly (to cover the target area),
+        then center crops to (target_height, target_width).
         Args:
             fx, fy: focal lengths
             cx, cy: principal point
             orig_width, orig_height: original image resolution
             target_width, target_height: target resolution
         Returns:
-            3x3 intrinsic matrix scaled to target resolution
+            3x3 intrinsic matrix adjusted for resize + center crop
         """
-        # Scale factors
-        scale_x = target_width / orig_width
-        scale_y = target_height / orig_height
+        # Step 1: Uniform resize (same logic as ImageCropAndResize.crop_and_resize)
+        scale = max(target_width / orig_width, target_height / orig_height)
+        resized_width = round(orig_width * scale)
+        resized_height = round(orig_height * scale)
         
-        # Scale intrinsics
-        fx_scaled = fx * scale_x
-        fy_scaled = fy * scale_y
-        cx_scaled = cx * scale_x
-        cy_scaled = cy * scale_y
+        fx_scaled = fx * scale
+        fy_scaled = fy * scale
+        cx_scaled = cx * scale
+        cy_scaled = cy * scale
+        
+        # Step 2: Center crop — shift principal point by the crop offset
+        crop_x = (resized_width - target_width) / 2.0
+        crop_y = (resized_height - target_height) / 2.0
+        cx_cropped = cx_scaled - crop_x
+        cy_cropped = cy_scaled - crop_y
         
         # Build intrinsic matrix
         K = np.array([
-            [fx_scaled, 0, cx_scaled],
-            [0, fy_scaled, cy_scaled],
+            [fx_scaled, 0, cx_cropped],
+            [0, fy_scaled, cy_cropped],
             [0, 0, 1]
         ])
         return K

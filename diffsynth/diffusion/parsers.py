@@ -60,6 +60,11 @@ def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     return parser
 
+def add_wandb_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--wandb_project", type=str, default=None, help="Wandb project name. If set, enables wandb logging.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name.")
+    return parser
+
 def add_general_config(parser: argparse.ArgumentParser):
     parser = add_dataset_base_config(parser)
     parser = add_model_config(parser)
@@ -67,4 +72,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
+    parser = add_wandb_config(parser)
     return parser
