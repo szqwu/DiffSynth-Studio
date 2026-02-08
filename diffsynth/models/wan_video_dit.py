@@ -293,10 +293,15 @@ class WanModel(torch.nn.Module):
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
         fuse_vae_embedding_in_latents_multiple: bool = False,
+        seperated_encoding: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.ffn_dim = ffn_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
         self.patch_size = patch_size
@@ -305,7 +310,7 @@ class WanModel(torch.nn.Module):
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.fuse_vae_embedding_in_latents_multiple = fuse_vae_embedding_in_latents_multiple
-        
+        self.seperated_encoding = seperated_encoding
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(

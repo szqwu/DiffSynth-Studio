@@ -26,6 +26,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         modify_channels=False,
         new_in_dim=None,
+        seperated_encoding=False,
+        fuse_vae_embedding_in_latents_multiple=False,
     ):
         super().__init__()
         # Warning
@@ -38,6 +40,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        
+        # Store these before modify_model_channels which needs them
+        self.seperated_encoding = seperated_encoding
+        self.fuse_vae_embedding_in_latents_multiple = fuse_vae_embedding_in_latents_multiple
         
         # Modify channels if requested (similar to CogVideoX approach)
         if modify_channels and new_in_dim is not None:
@@ -89,11 +95,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         old_model = model
         old_in_dim = model.in_dim
         
-        # Get old out_dim - need to inspect the head layer
-        # The head's final layer outputs out_dim * patch_size[0] * patch_size[1] * patch_size[2]
-        old_out_dim = 48
-        
-        # Keep the output dimension unchanged
+        old_out_dim = model.out_dim
         new_out_dim = old_out_dim
         
         # Get the old configuration
@@ -103,14 +105,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         new_model = WanModel(
             dim=model.dim,
             in_dim=new_in_dim,
-            ffn_dim=model.blocks[0].ffn[0].out_features,  # Extract from existing block
+            ffn_dim=model.ffn_dim,
             out_dim=new_out_dim,
             text_dim=model.text_embedding[0].in_features,
             freq_dim=model.freq_dim,
-            eps=1e-6,  # default eps
+            eps=1e-6,
             patch_size=model.patch_size,
-            num_heads=24, 
-            num_layers=30,
+            num_heads=model.num_heads,
+            num_layers=model.num_layers,
             has_image_input=model.has_image_input,
             has_image_pos_emb=model.has_image_pos_emb,
             has_ref_conv=model.has_ref_conv,
@@ -120,7 +122,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             require_vae_embedding=model.require_vae_embedding,
             require_clip_embedding=model.require_clip_embedding,
             fuse_vae_embedding_in_latents=model.fuse_vae_embedding_in_latents,
-            fuse_vae_embedding_in_latents_multiple = True,
+            fuse_vae_embedding_in_latents_multiple = self.fuse_vae_embedding_in_latents_multiple,
+            seperated_encoding=self.seperated_encoding,
         )
         
         # Load all pretrained weights EXCEPT layers with modified dimensions
@@ -142,7 +145,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         # Load the modified state dict
         new_model.load_state_dict(new_state_dict, strict=False)
-        new_model = new_model.to(device)
+        new_model = new_model.to(device=device, dtype=torch.bfloat16)
         
         # Replace the model in the pipeline
         if hasattr(self.pipe, 'dit') and self.pipe.dit is old_model:
@@ -236,6 +239,8 @@ def wan_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--modify_channels", default=False, action="store_true", help="Whether to modify the model's input channels.")
     parser.add_argument("--new_in_dim", type=int, default=None, help="New input dimension for the model (required if modify_channels is True).")
+    parser.add_argument("--seperated_encoding", default=False, action="store_true", help="Whether to use separated encoding.")
+    parser.add_argument("--fuse_vae_embedding_in_latents_multiple", default=False, action="store_true", help="Whether to fuse vae embedding in latents multiple times.")
     return parser
 
 
@@ -253,8 +258,8 @@ if __name__ == "__main__":
         num_frames=args.num_frames,
         height=args.height,
         width=args.width,
-        height_division_factor=16,
-        width_division_factor=16,
+        height_division_factor=8,
+        width_division_factor=8,
         time_division_factor=4,
         time_division_remainder=1,
     )
@@ -281,6 +286,8 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         modify_channels=args.modify_channels,
         new_in_dim=args.new_in_dim,
+        seperated_encoding=args.seperated_encoding,
+        fuse_vae_embedding_in_latents_multiple=args.fuse_vae_embedding_in_latents_multiple,
     )
     model_logger = ModelLogger(
         args.output_path,

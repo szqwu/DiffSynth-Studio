@@ -16,12 +16,22 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     if "first_frame_latents" in inputs:
         inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
     
+    if "first_frames_latents" in inputs:
+        # print(f"inputs['first_frames_latents'].shape: {inputs['first_frames_latents'].shape}")
+        # print(f"inputs['latents'].shape: {inputs['latents'].shape}")
+        inputs["latents"][:, :, :-1] = inputs["first_frames_latents"]
+    
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
     
     if "first_frame_latents" in inputs:
         noise_pred = noise_pred[:, :, 1:]
         training_target = training_target[:, :, 1:]
+    
+    if "first_frames_latents" in inputs:
+        # print(f"noise_pred.shape: {noise_pred.shape}")
+        noise_pred = noise_pred[:, :, inputs["first_frames_latents"].shape[2]:]
+        training_target = training_target[:, :, inputs["first_frames_latents"].shape[2]:]
     
     loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
     loss = loss * pipe.scheduler.training_weight(timestep)

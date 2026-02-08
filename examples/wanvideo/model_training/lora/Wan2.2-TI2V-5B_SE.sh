@@ -9,13 +9,13 @@ accelerate launch model_training/train_SE.py \
   --learning_rate 1e-4 \
   --num_epochs 40 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/Wan2.2-TI2V-5B_lora_SE" \
+  --output_path "./models/train/Wan2.2-TI2V-5B_lora128_SE_6to1" \
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
-  --lora_rank 32 \
+  --lora_rank 128 \
   --extra_inputs "input_image" \
   --modify_channels \
-  --new_in_dim 1584 \
-  --gradient_accumulation_steps 8 \
+  --new_in_dim 1572 \
+  --gradient_accumulation_steps 1 \
   --initialize_model_on_cpu
 

@@ -126,7 +126,7 @@ def raymap_to_plucker(raymap: Tensor) -> Tensor:
     plucker_normal = torch.cross(ray_origins, ray_directions, dim=-1)
     return torch.cat([ray_directions, plucker_normal], dim=-1)
 
-def get_plucker_rays(pose, intrinsic, height, width):
+def get_plucker_rays(pose, intrinsic, height, width, downsample_factor=8):
     """
     Compute Plucker ray maps for pose_in relative to pose_out (query pose).
     
@@ -143,7 +143,7 @@ def get_plucker_rays(pose, intrinsic, height, width):
     raymap = camera_to_raymap(intrinsic, pose, height=height, width=width, downscale=downscale_factor)
     plucker_ray_map = raymap_to_plucker(raymap)
     plucker_ray_map_permuted = plucker_ray_map.permute(0, 3, 1, 2)
-    pixel_unshuffle = torch.nn.PixelUnshuffle(downscale_factor=16)
+    pixel_unshuffle = torch.nn.PixelUnshuffle(downscale_factor=downsample_factor)
     plucker_ray_map_permuted_unshuffled = pixel_unshuffle(plucker_ray_map_permuted)
     # interpolate to 1/8 resolution
     # plucker_ray_map_permuted_unshuffled = F.interpolate(plucker_ray_map_permuted, scale_factor=1/8, mode='bilinear', align_corners=False)
@@ -512,6 +512,11 @@ class my_cognvs_dataset(Dataset):
         W_orig, H_orig = first_frame.size
         # print(f"W_orig: {W_orig}, H_orig: {H_orig}")
 
+        # prob = random.random()
+        # if prob < 0.8:
+        #     seperate_encoding_num_samples = num_frames
+        # else:
+        #     seperate_encoding_num_samples = random.randint(24, 48)
         seperate_encoding_num_samples = random.randint(24, 48)
         start_idx = random.randint(0, num_frames - seperate_encoding_num_samples)
         sampled_indices = list(range(start_idx, start_idx + seperate_encoding_num_samples))
@@ -528,14 +533,17 @@ class my_cognvs_dataset(Dataset):
         target_images = input_images.copy()
         
         # Sample the indices from the list
-        input_images = [input_images[i] for i in sampled_indices]
-        target_images = [target_images[i] for i in sampled_indices]
+        # input_images = [input_images[i] for i in sampled_indices]
+        # target_images = [target_images[i] for i in sampled_indices]
         # print(f"input_images: {len(input_images)}, target_images: {len(target_images)}")
 
         # Separate encoding
-        input_target_indices = np.random.choice(seperate_encoding_num_samples, 6, replace=False)
-        context_indices = input_target_indices[:5]
-        target_idx = input_target_indices[5:]
+        input_target_indices = np.random.choice(seperate_encoding_num_samples, self.num_frames, replace=False)
+        sampled_indices = [sampled_indices[i] for i in input_target_indices]
+        context_indices = sampled_indices[:self.num_frames-1]
+        target_idx = sampled_indices[self.num_frames-1:]
+        # print(f"sampled_indices: {sampled_indices}")
+        # print(f"context_indices: {context_indices}, target_idx: {target_idx}")
 
         context_frames = [input_images[i] for i in context_indices]
         target_frame = [target_images[i] for i in target_idx]
@@ -553,17 +561,23 @@ class my_cognvs_dataset(Dataset):
             w2cs = torch.linalg.inv(camera_poses)
             w2cs[:, [1, 2], :] *= -1  # OpenGL -> OpenCV
 
-            context_poses = w2cs[context_indices]
-            target_pose = w2cs[target_idx]
-            context_intrinsics = intrinsics[context_indices]
-            target_intrinsics = intrinsics[target_idx]
+            # context_poses = w2cs[context_indices]
+            # target_pose = w2cs[target_idx]
+            # context_intrinsics = intrinsics[context_indices]
+            # target_intrinsics = intrinsics[target_idx]
+            context_poses = w2cs[:self.num_frames-1]
+            target_pose = w2cs[self.num_frames-1:]
+            context_intrinsics = intrinsics[:self.num_frames-1]
+            target_intrinsics = intrinsics[self.num_frames-1:]
             w2cs = torch.cat([context_poses, target_pose], dim=0)
             intrinsics = np.concatenate([context_intrinsics, target_intrinsics], axis=0)
+            # print(f"w2cs shape: {w2cs.shape}")
+            # print(f"intrinsics shape: {intrinsics.shape}")
 
             _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
 
             raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width)
-            print(f"raymaps shape: {raymaps.shape}")
+            # print(f"raymaps shape: {raymaps.shape}")
             # Convert to torch tensor if it's numpy
             if isinstance(raymaps, np.ndarray):
                 raymaps = torch.from_numpy(raymaps).float()
