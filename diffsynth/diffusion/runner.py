@@ -41,7 +41,12 @@ def launch_training_task(
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
     global_step = 0
+    # Expose total epochs / current epoch to the dataset (used by curriculum sampling)
+    if hasattr(dataset, "num_epochs"):
+        dataset.num_epochs = num_epochs
     for epoch_id in range(num_epochs):
+        if hasattr(dataset, "current_epoch"):
+            dataset.current_epoch = epoch_id
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()

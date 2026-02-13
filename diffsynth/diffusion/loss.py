@@ -33,6 +33,11 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
         noise_pred = noise_pred[:, :, inputs["first_frames_latents"].shape[2]:]
         training_target = training_target[:, :, inputs["first_frames_latents"].shape[2]:]
     
+    if "mask_loss" in inputs:
+        noise_pred = noise_pred[:, :, -1:]
+        training_target = training_target[:, :, -1:]
+        # print(f"noise_pred.shape: {noise_pred.shape}")
+    
     loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
     loss = loss * pipe.scheduler.training_weight(timestep)
     return loss

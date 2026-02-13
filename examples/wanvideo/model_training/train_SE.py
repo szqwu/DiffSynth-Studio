@@ -28,6 +28,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         new_in_dim=None,
         seperated_encoding=False,
         fuse_vae_embedding_in_latents_multiple=False,
+        resume_checkpoint=None,
     ):
         super().__init__()
         # Warning
@@ -53,10 +54,13 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
+        # If resume_checkpoint is given, use it as the lora_checkpoint source too
+        effective_lora_checkpoint = resume_checkpoint if resume_checkpoint is not None else lora_checkpoint
+
         # Training mode
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
-            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
+            lora_base_model, lora_target_modules, lora_rank, effective_lora_checkpoint,
             preset_lora_path, preset_lora_model,
             task=task,
         )
@@ -64,6 +68,20 @@ class WanTrainingModule(DiffusionTrainingModule):
         # If channels were modified, unfreeze patch_embedding for training
         if modify_channels and new_in_dim is not None and lora_base_model is not None:
             self.unfreeze_patch_embedding(self.pipe, lora_base_model)
+
+        # Resume: load patch_embedding weights from checkpoint
+        # (mapping_lora_state_dict only keeps lora_A/lora_B keys, so patch_embedding
+        #  weights are dropped during the LoRA loading above — restore them here)
+        if resume_checkpoint is not None and lora_base_model is not None:
+            from diffsynth.core import load_state_dict as _load_sd
+            ckpt_sd = _load_sd(resume_checkpoint)
+            patch_emb_state = {k: v for k, v in ckpt_sd.items() if "patch_embedding" in k}
+            if patch_emb_state:
+                load_result = getattr(self.pipe, lora_base_model).load_state_dict(patch_emb_state, strict=False)
+                print(f"Resume: loaded {len(patch_emb_state)} patch_embedding keys from {resume_checkpoint}")
+            else:
+                print(f"Resume warning: no patch_embedding keys found in {resume_checkpoint}")
+            del ckpt_sd
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -116,8 +134,10 @@ class WanTrainingModule(DiffusionTrainingModule):
             has_image_input=model.has_image_input,
             has_image_pos_emb=model.has_image_pos_emb,
             has_ref_conv=model.has_ref_conv,
-            add_control_adapter=model.control_adapter is not None,
-            in_dim_control_adapter=24 if model.control_adapter is not None else 24,
+            # add_control_adapter=model.control_adapter is not None,
+            add_control_adapter=None,
+            # in_dim_control_adapter=24 if model.control_adapter is not None else 24,
+            in_dim_control_adapter=None,
             seperated_timestep=model.seperated_timestep,
             require_vae_embedding=model.require_vae_embedding,
             require_clip_embedding=model.require_clip_embedding,
@@ -241,6 +261,17 @@ def wan_parser():
     parser.add_argument("--new_in_dim", type=int, default=None, help="New input dimension for the model (required if modify_channels is True).")
     parser.add_argument("--seperated_encoding", default=False, action="store_true", help="Whether to use separated encoding.")
     parser.add_argument("--fuse_vae_embedding_in_latents_multiple", default=False, action="store_true", help="Whether to fuse vae embedding in latents multiple times.")
+    parser.add_argument("--resume_checkpoint", type=str, default=None,
+                        help="Path to a previously saved checkpoint (.safetensors) for resuming training. "
+                             "This loads BOTH LoRA weights AND patch_embedding weights. "
+                             "Use this INSTEAD of --lora_checkpoint for proper resume.")
+    parser.add_argument("--sampling_strategy", type=str, default="prob_random",
+                        choices=["all_random", "prob_random", "all_window", "curriculum"],
+                        help="Strategy for sampling seperate_encoding_num_samples: "
+                             "all_random (always full range), "
+                             "prob_random (80%% full / 20%% window [24,48]), "
+                             "all_window (always [24,48] window), "
+                             "curriculum (first half epochs window, second half random).")
     return parser
 
 
@@ -262,6 +293,7 @@ if __name__ == "__main__":
         width_division_factor=8,
         time_division_factor=4,
         time_division_remainder=1,
+        sampling_strategy=args.sampling_strategy,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -288,6 +320,7 @@ if __name__ == "__main__":
         new_in_dim=args.new_in_dim,
         seperated_encoding=args.seperated_encoding,
         fuse_vae_embedding_in_latents_multiple=args.fuse_vae_embedding_in_latents_multiple,
+        resume_checkpoint=args.resume_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,

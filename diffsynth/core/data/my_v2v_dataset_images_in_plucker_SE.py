@@ -365,7 +365,8 @@ class my_cognvs_dataset(Dataset):
             height_division_factor, 
             width_division_factor, 
             time_division_factor, 
-            time_division_remainder, 
+            time_division_remainder,
+            sampling_strategy="prob_random",
         ):
 
         self.base_path = base_path
@@ -379,6 +380,19 @@ class my_cognvs_dataset(Dataset):
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         self.load_from_cache = False  # This dataset doesn't use cached data
+
+        # Sampling strategy for seperate_encoding_num_samples:
+        #   "all_random"  : always use the full range (num_frames)
+        #   "prob_random"  : 80% full range, 20% window [24,48]  (original behaviour)
+        #   "all_window"   : always sample window from [24,48]
+        #   "curriculum"   : first half of epochs -> all_window, second half -> all_random
+        assert sampling_strategy in ("all_random", "prob_random", "all_window", "curriculum"), \
+            f"Unknown sampling_strategy: {sampling_strategy}"
+        self.sampling_strategy = sampling_strategy
+
+        # These will be set by the training loop each epoch (needed for curriculum)
+        self.current_epoch = 0
+        self.num_epochs = 1
 
         # get full path of videos
         # self.video_list_dl3dv = [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith('.mp4')]
@@ -436,7 +450,7 @@ class my_cognvs_dataset(Dataset):
             - intrinsics: (N, 3, 3) numpy array
             - camera_poses: (N, 4, 4) numpy array
         """
-        transforms_path = os.path.join(self.metadata_path, video_name.replace("images_4", "transforms.json"))
+        transforms_path = video_name.replace("images_4", "transforms.json")
         
         if not os.path.exists(transforms_path):
             logger.warning(f"transforms.json not found: {transforms_path}")
@@ -490,6 +504,21 @@ class my_cognvs_dataset(Dataset):
             traceback.print_exc()
             return None, None
 
+    def get_num_camera_frames(self, video_path):
+        """
+        Get the number of frames available in transforms.json for a given video path.
+        This ensures sampled indices stay within the range of available camera parameters.
+        """
+        transforms_path = video_path.replace("images_4", "transforms.json")
+        if not os.path.exists(transforms_path):
+            return None
+        try:
+            with open(transforms_path, 'r') as f:
+                transforms_data = json.load(f)
+            return len(transforms_data['frames'])
+        except Exception:
+            return None
+
     def __len__(self):
         """Return the total number of sequences."""
         return len(self.video_list)
@@ -516,16 +545,34 @@ class my_cognvs_dataset(Dataset):
             return self.__getitem__((idx + 1) % len(self))
 
         num_frames = min(len(input_video_frames), len(target_video_frames))
+        # Cap to the number of frames in transforms.json so sampled indices stay valid
+        num_camera_frames = self.get_num_camera_frames(input_video_path)
+        if num_camera_frames is not None:
+            num_frames = min(num_frames, num_camera_frames)
         first_frame = input_video_frames[0]
         W_orig, H_orig = first_frame.size
         # print(f"W_orig: {W_orig}, H_orig: {H_orig}")
 
-        # prob = random.random()
-        # if prob < 0.8:
-        #     seperate_encoding_num_samples = num_frames
-        # else:
-        #     seperate_encoding_num_samples = random.randint(24, 48)
-        seperate_encoding_num_samples = random.randint(24, 48)
+        # Determine seperate_encoding_num_samples based on sampling_strategy
+        if self.sampling_strategy == "all_random":
+            seperate_encoding_num_samples = num_frames
+        elif self.sampling_strategy == "prob_random":
+            prob = random.random()
+            if prob < 0.8:
+                seperate_encoding_num_samples = num_frames
+            else:
+                seperate_encoding_num_samples = random.randint(24, 48)
+        elif self.sampling_strategy == "all_window":
+            seperate_encoding_num_samples = random.randint(24, 48)
+        elif self.sampling_strategy == "curriculum":
+            # print(f"current_epoch: {self.current_epoch}, num_epochs: {self.num_epochs}")
+            # First half of training: small windows; second half: full random
+            if self.current_epoch < self.num_epochs // 2:
+                seperate_encoding_num_samples = random.randint(24, 48)
+            else:
+                seperate_encoding_num_samples = num_frames
+        else:
+            seperate_encoding_num_samples = num_frames
         start_idx = random.randint(0, num_frames - seperate_encoding_num_samples)
         sampled_indices = list(range(start_idx, start_idx + seperate_encoding_num_samples))
 

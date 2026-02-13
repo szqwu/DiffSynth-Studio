@@ -334,7 +334,7 @@ class WanVideoPipeline(BasePipeline):
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
         # Decode
         self.load_models_to_device(['vae'])
-        if self.dit.fuse_vae_embedding_in_latents_multiple:
+        if self.dit.fuse_vae_embedding_in_latents_multiple or self.dit.seperated_encoding:
             video = []
             for i in range(inputs_shared["latents"].shape[2]):
                 video.append(self.vae.decode(inputs_shared["latents"][:, :, i:i+1], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride))
@@ -436,7 +436,7 @@ class WanVideoUnit_InputVideoEmbedderMultiple(PipelineUnit):
             input_latents.append(pipe.vae.encode(input_video[:, :, i:i+1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device))
         input_latents = torch.concat(input_latents, dim=2)
         if pipe.scheduler.training:
-            return {"latents": noise, "input_latents": input_latents}
+            return {"latents": noise, "input_latents": input_latents, "mask_loss": True}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
             return {"latents": latents}
