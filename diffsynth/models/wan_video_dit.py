@@ -138,13 +138,32 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, prope_attn=None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
+        if prope_attn is not None:
+            # PRoPE path: camera-geometry-aware positional encoding
+            # Reshape to (B, num_heads, S, head_dim) for PRoPE
+            q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+            q = prope_attn._apply_to_q(q)
+            k = prope_attn._apply_to_kv(k)
+            v = prope_attn._apply_to_kv(v)
+            # PRoPE's projection matrices are not norm-preserving (unlike RoPE rotations),
+            # so Q/K magnitudes can grow unboundedly, causing attention logit explosion.
+            # Normalize Q and K to restore the expected scale for dot-product attention.
+            q = F.normalize(q, dim=-1) * (q.shape[-1] ** 0.5)
+            k = F.normalize(k, dim=-1) * (k.shape[-1] ** 0.5)
+            x = F.scaled_dot_product_attention(q, k, v)
+            x = prope_attn._apply_to_o(x)
+            x = rearrange(x, "b n s d -> b s (n d)")
+        else:
+            # Original path: 3D grid RoPE
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+            x = self.attn(q, k, v)
         return self.o(x)
 
 
@@ -212,7 +231,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, prope_attn=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -224,7 +243,7 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, prope_attn=prope_attn))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -294,6 +313,7 @@ class WanModel(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool = False,
         fuse_vae_embedding_in_latents_multiple: bool = False,
         seperated_encoding: bool = False,
+        reverse_pred_order: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -311,6 +331,7 @@ class WanModel(torch.nn.Module):
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.fuse_vae_embedding_in_latents_multiple = fuse_vae_embedding_in_latents_multiple
         self.seperated_encoding = seperated_encoding
+        self.reverse_pred_order = reverse_pred_order
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(
@@ -347,7 +368,20 @@ class WanModel(torch.nn.Module):
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
         if self.control_adapter is not None and control_camera_latents_input is not None:
-            y_camera = self.control_adapter(control_camera_latents_input)
+            # If adapter is frozen, skip storing activations to save GPU memory
+            # and offload weights to CPU between forward passes
+            adapter_trainable = any(p.requires_grad for p in self.control_adapter.parameters())
+            if adapter_trainable:
+                y_camera = self.control_adapter(control_camera_latents_input)
+            else:
+                # Move frozen adapter to GPU, run forward, move back to CPU
+                device = control_camera_latents_input.device
+                self.control_adapter.to(device)
+                with torch.no_grad():
+                    y_camera = self.control_adapter(control_camera_latents_input)
+                y_camera = y_camera.detach()
+                self.control_adapter.to("cpu")
+                torch.cuda.empty_cache()
             x = [u + v for u, v in zip(x, y_camera)]
             x = x[0].unsqueeze(0)
         return x
@@ -367,6 +401,9 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                viewmats: Optional[torch.Tensor] = None,
+                Ks: Optional[torch.Tensor] = None,
+                image_hw: Optional[Tuple[int, int]] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -387,9 +424,24 @@ class WanModel(torch.nn.Module):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
         
-        def create_custom_forward(module):
+        # Prepare PRoPE if camera parameters are provided
+        prope_attn = None
+        if viewmats is not None and Ks is not None and image_hw is not None:
+            from .prope import PropeDotProductAttention
+            head_dim = self.dim // self.num_heads
+            prope_attn = PropeDotProductAttention(
+                head_dim=head_dim,
+                patches_x=w, patches_y=h,
+                image_width=image_hw[1], image_height=image_hw[0],
+            ).to(x.device)
+            prope_attn._precompute_and_cache_apply_fns(
+                viewmats.to(dtype=x.dtype, device=x.device),
+                Ks.to(dtype=x.dtype, device=x.device),
+            )
+        
+        def create_custom_forward(module, _prope_attn=None):
             def custom_forward(*inputs):
-                return module(*inputs)
+                return module(*inputs, prope_attn=_prope_attn)
             return custom_forward
 
         for block in self.blocks:
@@ -397,18 +449,18 @@ class WanModel(torch.nn.Module):
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
+                            create_custom_forward(block, prope_attn),
                             x, context, t_mod, freqs,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
+                        create_custom_forward(block, prope_attn),
                         x, context, t_mod, freqs,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, prope_attn=prope_attn)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

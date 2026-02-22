@@ -367,6 +367,8 @@ class my_cognvs_dataset(Dataset):
             time_division_factor, 
             time_division_remainder,
             sampling_strategy="prob_random",
+            reverse_pred_order=False,
+            num_dataset_samples=1000,
         ):
 
         self.base_path = base_path
@@ -380,6 +382,7 @@ class my_cognvs_dataset(Dataset):
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         self.load_from_cache = False  # This dataset doesn't use cached data
+        self.reverse_pred_order = reverse_pred_order
 
         # Sampling strategy for seperate_encoding_num_samples:
         #   "all_random"  : always use the full range (num_frames)
@@ -397,7 +400,10 @@ class my_cognvs_dataset(Dataset):
         # get full path of videos
         # self.video_list_dl3dv = [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith('.mp4')]
         self.video_list_dl3dv = [os.path.join(base_path, f, "images_4") for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
-        self.video_list = self.video_list_dl3dv
+        self.video_list_dl3dv_2k_path = '/data2/qiwu2/2K'
+        self.video_list_dl3dv_2k = [os.path.join(self.video_list_dl3dv_2k_path, f, "images_4") for f in os.listdir(self.video_list_dl3dv_2k_path) if os.path.isdir(os.path.join(self.video_list_dl3dv_2k_path, f))]
+        self.video_list_dl3dv = self.video_list_dl3dv + self.video_list_dl3dv_2k
+        self.video_list = self.video_list_dl3dv[:num_dataset_samples]
         self.video_list.sort()
         print(f"Total number of videos: {len(self.video_list)}")
 
@@ -603,7 +609,12 @@ class my_cognvs_dataset(Dataset):
         context_frames = [input_images[i] for i in context_indices]
         target_frame = [target_images[i] for i in target_idx]
         
-        target_images = context_frames + target_frame
+        if self.reverse_pred_order:
+            # Prediction target is the FIRST frame, context frames follow
+            target_images = target_frame + context_frames
+        else:
+            # Original: context frames first, prediction target last
+            target_images = context_frames + target_frame
         input_images = context_frames
         # print(f"target_images: {len(target_images)}, input_images: {len(input_images)}")
 
@@ -624,12 +635,23 @@ class my_cognvs_dataset(Dataset):
             target_pose = w2cs[self.num_frames-1:]
             context_intrinsics = intrinsics[:self.num_frames-1]
             target_intrinsics = intrinsics[self.num_frames-1:]
-            w2cs = torch.cat([context_poses, target_pose], dim=0)
-            intrinsics = np.concatenate([context_intrinsics, target_intrinsics], axis=0)
+            if self.reverse_pred_order:
+                # Target first, then context
+                w2cs = torch.cat([target_pose, context_poses], dim=0)
+                intrinsics = np.concatenate([target_intrinsics, context_intrinsics], axis=0)
+            else:
+                # Original: context first, then target
+                w2cs = torch.cat([context_poses, target_pose], dim=0)
+                intrinsics = np.concatenate([context_intrinsics, target_intrinsics], axis=0)
             # print(f"w2cs shape: {w2cs.shape}")
             # print(f"intrinsics shape: {intrinsics.shape}")
 
-            _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
+            if self.reverse_pred_order:
+                # Normalize to first camera (the prediction target)
+                _, camera_poses_norm, _ = normalize_w2c_make_cam0_origin(w2cs)
+            else:
+                # Normalize to last camera (the prediction target)
+                _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
 
             raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width)
             # print(f"raymaps shape: {raymaps.shape}")
@@ -644,6 +666,11 @@ class my_cognvs_dataset(Dataset):
             metadata["has_camera_params"] = True
             camera_conditions = raymaps
 
+            # Also store normalized c2w and intrinsics as top-level keys
+            # for the SimpleAdapter camera control path (uses ray_condition internally)
+            camera_poses_norm_out = camera_poses_norm  # [T, 4, 4] c2w
+            intrinsics_out = torch.from_numpy(intrinsics).float()  # [T, 3, 3]
+
         else:
             logger.warning(f"Could not load camera parameters for {input_video_path}, raymaps not available")
             metadata["has_camera_params"] = False
@@ -653,12 +680,16 @@ class my_cognvs_dataset(Dataset):
                 self.height // self.height_division_factor, 
                 self.width // self.width_division_factor
             )
+            camera_poses_norm_out = torch.eye(4).unsqueeze(0).repeat(self.num_frames, 1, 1)
+            intrinsics_out = torch.eye(3).unsqueeze(0).repeat(self.num_frames, 1, 1)
 
         data = {
             "input_images": input_images,
             "target_images": target_images,
             "metadata": metadata,
             "raymap": camera_conditions,
+            "camera_poses_norm": camera_poses_norm_out,
+            "intrinsics": intrinsics_out,
             "prompt": "",  # Empty prompt for unconditional generation
             # "input_indices": list(input_target_indices) if self.data_strategy == "seperate_encoding" else None
         }

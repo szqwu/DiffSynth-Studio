@@ -1,0 +1,132 @@
+{
+  "os": "Linux-4.18.0-372.32.1.el8_6.x86_64-x86_64-with-glibc2.28",
+  "python": "CPython 3.11.14",
+  "startedAt": "2026-02-14T02:59:07.107820Z",
+  "args": [
+    "--dataset_base_path",
+    "../../../DL3DV-10K_960P/1K",
+    "--dataset_metadata_path",
+    "../../../DL3DV-10K_960P/1K",
+    "--height",
+    "192",
+    "--width",
+    "336",
+    "--num_frames",
+    "7",
+    "--dataset_repeat",
+    "1",
+    "--model_id_with_origin_paths",
+    "PAI/Wan2.1-Fun-V1.1-14B-Control-Camera:diffusion_pytorch_model*.safetensors,PAI/Wan2.1-Fun-V1.1-14B-Control-Camera:models_t5_umt5-xxl-enc-bf16.pth,PAI/Wan2.1-Fun-V1.1-14B-Control-Camera:Wan2.1_VAE.pth,PAI/Wan2.1-Fun-V1.1-14B-Control-Camera:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+    "--learning_rate",
+    "1e-4",
+    "--num_epochs",
+    "80",
+    "--remove_prefix_in_ckpt",
+    "pipe.dit.",
+    "--output_path",
+    "./models/train/Wan2.1-SE-CameraAdapter-14B-lora32-6to1",
+    "--lora_base_model",
+    "dit",
+    "--lora_target_modules",
+    "q,k,v,o,ffn.0,ffn.2",
+    "--lora_rank",
+    "32",
+    "--extra_inputs",
+    "input_image",
+    "--gradient_accumulation_steps",
+    "1",
+    "--initialize_model_on_cpu",
+    "--seperated_encoding",
+    "--use_camera_adapter",
+    "--sampling_strategy",
+    "prob_random",
+    "--wandb_project",
+    "wan-se-14b",
+    "--wandb_run_name",
+    "camera-adapter-lora32-6to1"
+  ],
+  "program": "/data2/qiwu2/DiffSynth-Studio/examples/wanvideo/model_training/train_SE.py",
+  "codePath": "examples/wanvideo/model_training/train_SE.py",
+  "codePathLocal": "model_training/train_SE.py",
+  "git": {
+    "remote": "git@github.com:szqwu/DiffSynth-Studio.git",
+    "commit": "6621e61efc46970a04c44a481db4ae51d8cf7a20"
+  },
+  "email": "szqwu57@gmail.com",
+  "root": "/data2/qiwu2/DiffSynth-Studio/examples/wanvideo",
+  "host": "trinity-1-38",
+  "executable": "/home/qiwu2/anaconda3/envs/wan2/bin/python3.11",
+  "cpu_count": 48,
+  "cpu_count_logical": 96,
+  "gpu": "NVIDIA RTX 6000 Ada Generation",
+  "gpu_count": 8,
+  "disk": {
+    "/": {
+      "total": "205349208064",
+      "used": "96235155456"
+    }
+  },
+  "memory": {
+    "total": "1081957167104"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-57af34aa-a463-7b1b-efc2-6272d833d9c7"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-f596dd05-8ac2-f51c-65b0-ac6ef2b9521d"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-298a4eba-7866-2640-8309-30480a4e17d5"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-08e26e78-ce6c-71a2-d2fe-202f634ba063"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-5c5721ae-aa77-122a-61cd-99fa09095e8f"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-4fbc2df2-f2e1-e4cb-7598-3274b3e96b59"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-0c52d29d-5d69-4ba1-5470-12a68ae54d24"
+    },
+    {
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memoryTotal": "51527024640",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-1f938115-7e10-7676-199e-268f3c2e64d6"
+    }
+  ],
+  "cudaVersion": "13.1",
+  "writerId": "7yrceappyz16ll435n9vuwnnytsnftc2"
+}

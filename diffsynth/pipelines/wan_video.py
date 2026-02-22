@@ -67,6 +67,8 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_FunControl(),
             WanVideoUnit_FunReference(),
             WanVideoUnit_FunCameraControl(),
+            WanVideoUnit_FunCameraControlSE(),
+            WanVideoUnit_ProPE(),
             WanVideoUnit_SpeedControl(),
             WanVideoUnit_VACE(),
             WanVideoUnit_AnimateVideoSplit(),
@@ -251,6 +253,9 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         output_type: Optional[Literal["quantized", "floatpoint"]] = "quantized",
         raymap: Optional[torch.Tensor] = None,
+        camera_poses_norm: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+        use_prope: bool = False,
         num_latent_frames: Optional[int] = None,
     ):
         # Scheduler
@@ -286,6 +291,9 @@ class WanVideoPipeline(BasePipeline):
             "animate_pose_video": animate_pose_video, "animate_face_video": animate_face_video, "animate_inpaint_video": animate_inpaint_video, "animate_mask_video": animate_mask_video,
             "vap_video": vap_video,
             "raymap": raymap,
+            "camera_poses_norm": camera_poses_norm,
+            "intrinsics": intrinsics,
+            "use_prope": use_prope,
             "num_latent_frames": num_latent_frames,
         }
         for unit in self.units:
@@ -436,7 +444,11 @@ class WanVideoUnit_InputVideoEmbedderMultiple(PipelineUnit):
             input_latents.append(pipe.vae.encode(input_video[:, :, i:i+1], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device))
         input_latents = torch.concat(input_latents, dim=2)
         if pipe.scheduler.training:
-            return {"latents": noise, "input_latents": input_latents, "mask_loss": True}
+            reverse_pred = getattr(pipe.dit, 'reverse_pred_order', False)
+            if reverse_pred:
+                return {"latents": noise, "input_latents": input_latents, "mask_loss_first": True}
+            else:
+                return {"latents": noise, "input_latents": input_latents, "mask_loss": True}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
             return {"latents": latents}
@@ -548,15 +560,28 @@ class WanVideoUnit_ImageEmbedderVAE_SeparatedEncoding(PipelineUnit):
         # print(f"image.shape: {image.shape}")
         # print(f"height: {height}")
         # print(f"width: {width}")
+        
+        reverse_pred = getattr(pipe.dit, 'reverse_pred_order', False)
+        
         msk = torch.ones(1, len(input_image)+1, height//8, width//8, device=pipe.device)
-        # Mask out all frames beyond the context images (they need to be generated)
-        msk[:, len(input_image):] = 0
+        if reverse_pred:
+            # Reversed: first frame is prediction target (mask=0), rest are context (mask=1)
+            msk[:, :1] = 0
+        else:
+            # Original: last frame is prediction target (mask=0), context frames first (mask=1)
+            msk[:, len(input_image):] = 0
+        
         if end_image is not None:
             end_image = pipe.preprocess_image(end_image.resize((width, height))).to(pipe.device)
             vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
             msk[:, -1:] = 1
         else:
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, 1, height, width).to(image.device)], dim=1)
+            if reverse_pred:
+                # Reversed: zeros for target (first), then context images
+                vae_input = torch.concat([torch.zeros(3, 1, height, width).to(image.device), image.transpose(0, 1)], dim=1)
+            else:
+                # Original: context images first, then zeros for target (last)
+                vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, 1, height, width).to(image.device)], dim=1)
 
         # Repeat each frame's mask 4 times temporally, then group into 4 channels
         # to match the standard VAE embedding mask format [4, num_frames, h//8, w//8]
@@ -569,7 +594,8 @@ class WanVideoUnit_ImageEmbedderVAE_SeparatedEncoding(PipelineUnit):
             ys.append(pipe.vae.encode([vae_input[:, i:i+1].to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0])
         y = torch.concat(ys, dim=1)
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-        y = torch.concat([msk, y])
+        if pipe.dit.control_adapter is None:
+            y = torch.concat([msk, y])
         y = y.unsqueeze(0)
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         # print(f"y.shape: {y.shape}")
@@ -723,6 +749,106 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
             y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"control_camera_latents_input": control_camera_latents_input, "y": y}
 
+
+class WanVideoUnit_FunCameraControlSE(PipelineUnit):
+    """
+    Camera control for Separated Encoding using the pretrained SimpleAdapter.
+    Takes c2w poses + intrinsics from the dataloader, computes Plucker embeddings
+    using the camera controller's own ray_condition (matching the pretrained model),
+    packs 4 copies per frame (SE repeat-4 convention, same as msk), and returns
+    control_camera_latents_input for the SimpleAdapter inside patchify.
+
+    Inputs:
+        camera_poses_norm  [T, 4, 4]  c2w poses (normalized to last frame)
+        intrinsics         [T, 3, 3]  camera intrinsic matrices (pixel values)
+        height, width      image resolution (for ray_condition)
+    Output:
+        control_camera_latents_input  [1, 24, T, H, W]
+    """
+    def __init__(self):
+        super().__init__(
+            input_params=("camera_poses_norm", "intrinsics", "height", "width"),
+            output_params=("control_camera_latents_input",),
+        )
+
+    def process(self, pipe: WanVideoPipeline, camera_poses_norm, intrinsics, height, width):
+        if camera_poses_norm is None:
+            return {}
+
+        from diffsynth.models.wan_video_camera_controller import ray_condition
+
+        # camera_poses_norm: [T, 4, 4] c2w (normalized, last frame = identity)
+        # intrinsics:        [T, 3, 3] camera intrinsic matrices (pixel values)
+        T = camera_poses_norm.shape[0]
+
+        # Extract [fx, fy, cx, cy] from 3×3 intrinsic matrix
+        # K matrix: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        fx = intrinsics[:, 0, 0]  # [T]
+        fy = intrinsics[:, 1, 1]  # [T]
+        cx = intrinsics[:, 0, 2]  # [T]
+        cy = intrinsics[:, 1, 2]  # [T]
+        K = torch.stack([fx, fy, cx, cy], dim=-1).unsqueeze(0)  # [1, T, 4]
+
+        c2w = camera_poses_norm.unsqueeze(0)  # [1, T, 4, 4]
+
+        # Compute Plucker embedding in float32 to avoid bfloat16 precision issues
+        # (divisions by focal length, direction normalization, cross products)
+        # Output: [1, T, H, W, 6]
+        plucker_embedding = ray_condition(K.float(), c2w.float(), height, width, device=pipe.device)
+
+        # [1, T, H, W, 6] → [T, 6, H, W]
+        plucker = plucker_embedding[0].permute(0, 3, 1, 2)  # [T, 6, H, W]
+        C = 6
+
+        # Reshape to [1, 6, T, H, W]
+        plucker = plucker.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 6, T, H, W]
+
+        # Repeat each frame 4 times along temporal dim (like msk in SE conditioning)
+        # [1, 6, T*4, H, W]
+        plucker = torch.repeat_interleave(plucker, repeats=4, dim=2)
+
+        # Reshape: group every 4 consecutive temporal frames → channels
+        # [1, 6, T, 4, H, W] → permute → [1, 6, 4, T, H, W] → merge → [1, 24, T, H, W]
+        plucker = plucker.view(1, C, T, 4, height, width)
+        plucker = plucker.permute(0, 1, 3, 2, 4, 5).contiguous().view(1, C * 4, T, height, width)
+
+        control_camera_latents_input = plucker.to(device=pipe.device, dtype=pipe.torch_dtype)
+        return {"control_camera_latents_input": control_camera_latents_input}
+
+
+class WanVideoUnit_ProPE(PipelineUnit):
+    """
+    Prepare camera parameters for PRoPE (Projective Positional Encoding).
+    Converts c2w poses to w2c viewmats and packages intrinsics for PRoPE attention.
+
+    Inputs:
+        camera_poses_norm  [T, 4, 4]  c2w poses (normalized)
+        intrinsics         [T, 3, 3]  camera intrinsic matrices (pixel values)
+        height, width      image resolution
+    Output:
+        viewmats           [1, T, 4, 4]  w2c (world-to-camera) matrices for PRoPE
+        Ks                 [1, T, 3, 3]  intrinsic matrices for PRoPE
+        image_hw           (height, width) tuple
+    """
+    def __init__(self):
+        super().__init__(
+            input_params=("use_prope", "camera_poses_norm", "intrinsics", "height", "width"),
+            output_params=("viewmats", "Ks", "image_hw"),
+        )
+
+    def process(self, pipe: WanVideoPipeline, use_prope, camera_poses_norm, intrinsics, height, width):
+        if not use_prope or camera_poses_norm is None or intrinsics is None:
+            return {}
+
+        # camera_poses_norm is c2w (camera-to-world), PRoPE needs w2c (world-to-camera)
+        viewmats = torch.linalg.inv(camera_poses_norm.float()).to(camera_poses_norm.dtype)  # [T, 4, 4]
+        viewmats = viewmats.unsqueeze(0)  # [1, T, 4, 4] = (batch, cameras, 4, 4)
+
+        Ks = intrinsics.unsqueeze(0)  # [1, T, 3, 3] = (batch, cameras, 3, 3)
+
+        image_hw = (height, width)
+
+        return {"viewmats": viewmats, "Ks": Ks, "image_hw": image_hw}
 
 
 class WanVideoUnit_SpeedControl(PipelineUnit):
@@ -1281,6 +1407,9 @@ def model_fn_wan_video(
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
     raymap: Optional[torch.Tensor] = None,
+    viewmats: Optional[torch.Tensor] = None,
+    Ks: Optional[torch.Tensor] = None,
+    image_hw: Optional[tuple] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1430,6 +1559,21 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    # PRoPE: camera-geometry-aware positional encoding (replaces 3D RoPE when enabled)
+    prope_attn = None
+    if viewmats is not None and Ks is not None and image_hw is not None:
+        from diffsynth.models.prope import PropeDotProductAttention
+        head_dim = dit.dim // dit.num_heads
+        prope_attn = PropeDotProductAttention(
+            head_dim=head_dim,
+            patches_x=w, patches_y=h,
+            image_width=image_hw[1], image_height=image_hw[0],
+        ).to(x.device)
+        prope_attn._precompute_and_cache_apply_fns(
+            viewmats.to(dtype=x.dtype, device=x.device),
+            Ks.to(dtype=x.dtype, device=x.device),
+        )
+
     # VAP 
     if vap is not None:
         # hidden state
@@ -1472,9 +1616,9 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
-        def create_custom_forward(module):
+        def create_custom_forward(module, _prope_attn=None):
             def custom_forward(*inputs):
-                return module(*inputs)
+                return module(*inputs, prope_attn=_prope_attn)
             return custom_forward
         
         def create_custom_forward_vap(block, vap):
@@ -1504,18 +1648,18 @@ def model_fn_wan_video(
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
+                            create_custom_forward(block, prope_attn),
                             x, context, t_mod, freqs,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
+                        create_custom_forward(block, prope_attn),
                         x, context, t_mod, freqs,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs)
+                    x = block(x, context, t_mod, freqs, prope_attn=prope_attn)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

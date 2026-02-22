@@ -3,10 +3,21 @@
 # Script to run Wan2.1 6-to-1 NVS evaluation on DL3DV-10K scenes
 # Processes all scenes sequentially on a single GPU
 
+# ── Mode: "standard" or "prope" ───────────────────────────────────────────────
+MODE="${1:-prope}"
+
 # ── Configuration ──────────────────────────────────────────────────────────────
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_curriculum/epoch-79.safetensors"
-output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_curriculum"
-GPU_ID=6
+if [ "$MODE" = "prope" ]; then
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_prope/epoch-39.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_prope-119"
+    EXTRA_ARGS="--use_prope"
+else
+    # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_curriculum/epoch-79.safetensors"
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-19.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-19_192p"
+    EXTRA_ARGS=""
+fi
+GPU_ID=5
 
 # All 10 DL3DV-10K test scenes
 SCENES=(
@@ -25,6 +36,7 @@ SCENES=(
 echo "========================================"
 echo "Wan2.1 6-to-1 NVS - DL3DV-10K Evaluation"
 echo "========================================"
+echo "Mode: $MODE"
 echo "Checkpoint: $checkpoint_path"
 echo "Output path: $output_path"
 echo "GPU: $GPU_ID"
@@ -43,8 +55,10 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python test_wan2.1_6to1.py \
     --use_dreamsim \
     --use_ssim \
     --use_lpips \
-    # --height 480 \
-    # --width 832
+    --input_mode "crop" \
+    --height 192 \
+    --width 336 \
+    $EXTRA_ARGS
 echo ""
 echo "Done!"
 

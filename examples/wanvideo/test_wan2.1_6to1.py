@@ -175,6 +175,11 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
     Follows the exact same logic as cog-nvs test and the training dataset.
 
     NOTE: intrinsics must already be scaled to (height, width) before calling.
+
+    Returns:
+        raymap: [N, C, H/8, W/8] plucker ray features
+        camera_poses_norm: [N, 4, 4] normalized c2w poses (last cam = identity)
+        intrinsics_tensor: [N, 3, 3] intrinsic matrices
     """
     context_camera_poses = extrinsics[context_indices]
     target_camera_poses = extrinsics[target_indices]
@@ -188,21 +193,22 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
     context_intrinsics = intrinsics[context_indices]
     target_intrinsics = intrinsics[target_indices]
     intrinsics_cat = np.concatenate([context_intrinsics, target_intrinsics], axis=0)
+    intrinsics_tensor = torch.from_numpy(intrinsics_cat).float()
 
     # Normalize so last camera (target) is at origin
     _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
 
-    # Compute plucker rays → [N, C, H/16, W/16]
+    # Compute plucker rays → [N, C, H/8, W/8]
     raymap = get_plucker_rays(
         camera_poses_norm,
-        torch.from_numpy(intrinsics_cat).float(),
+        intrinsics_tensor,
         height=height,
         width=width,
     )
     if isinstance(raymap, np.ndarray):
         raymap = torch.from_numpy(raymap).float()
 
-    return raymap
+    return raymap, camera_poses_norm, intrinsics_tensor
 
 
 def center_crop(img, crop_size):
@@ -231,6 +237,34 @@ def resize_and_center_crop(img, target_size=576):
 
     img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return center_crop(img_resized, target_size)
+
+
+def resize_crop_to_rect(img, target_h, target_w):
+    """
+    Resize image so it covers (target_h, target_w), then center crop.
+
+    Returns:
+        cropped_img: np.ndarray (target_h, target_w, 3)
+        scale: float — uniform scale factor applied
+        crop_offset_x: int — horizontal crop offset (pixels in resized image)
+        crop_offset_y: int — vertical crop offset (pixels in resized image)
+    """
+    if isinstance(img, Image.Image):
+        img = np.array(img)
+
+    h, w = img.shape[:2]
+    scale = max(target_h / h, target_w / w)
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+
+    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    crop_offset_y = (new_h - target_h) // 2
+    crop_offset_x = (new_w - target_w) // 2
+    cropped = img_resized[crop_offset_y:crop_offset_y + target_h,
+                          crop_offset_x:crop_offset_x + target_w]
+
+    return cropped, scale, crop_offset_x, crop_offset_y
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -320,14 +354,38 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     scaled_intrinsic_960p[1, 2] *= scale_h_960
 
     # Further scale intrinsics to model input resolution
-    model_scale_w = model_w / actual_w
-    model_scale_h = model_h / actual_h
+    input_mode = args.input_mode
+    if input_mode == "crop":
+        # Resize uniformly to cover model_h x model_w, then center crop
+        crop_scale = max(model_h / actual_h, model_w / actual_w)
+        resized_h = int(round(actual_h * crop_scale))
+        resized_w = int(round(actual_w * crop_scale))
+        crop_offset_x = (resized_w - model_w) / 2.0
+        crop_offset_y = (resized_h - model_h) / 2.0
 
-    scaled_intrinsic_model = scaled_intrinsic_960p.copy()
-    scaled_intrinsic_model[0, 0] *= model_scale_w
-    scaled_intrinsic_model[1, 1] *= model_scale_h
-    scaled_intrinsic_model[0, 2] *= model_scale_w
-    scaled_intrinsic_model[1, 2] *= model_scale_h
+        scaled_intrinsic_model = scaled_intrinsic_960p.copy()
+        # Apply uniform resize scale
+        scaled_intrinsic_model[0, 0] *= crop_scale   # fx
+        scaled_intrinsic_model[1, 1] *= crop_scale   # fy
+        scaled_intrinsic_model[0, 2] *= crop_scale   # cx
+        scaled_intrinsic_model[1, 2] *= crop_scale   # cy
+        # Adjust principal point for center crop offset
+        scaled_intrinsic_model[0, 2] -= crop_offset_x  # cx
+        scaled_intrinsic_model[1, 2] -= crop_offset_y  # cy
+
+        print(f"  Input mode: crop (scale={crop_scale:.4f}, crop_offset=({crop_offset_x},{crop_offset_y}))")
+    else:
+        # Stretch to model resolution (default)
+        model_scale_w = model_w / actual_w
+        model_scale_h = model_h / actual_h
+
+        scaled_intrinsic_model = scaled_intrinsic_960p.copy()
+        scaled_intrinsic_model[0, 0] *= model_scale_w
+        scaled_intrinsic_model[1, 1] *= model_scale_h
+        scaled_intrinsic_model[0, 2] *= model_scale_w
+        scaled_intrinsic_model[1, 2] *= model_scale_h
+
+        print(f"  Input mode: stretch")
 
     print(f"  Original res: {orig_w}x{orig_h}, actual 960p: {actual_w}x{actual_h}, model: {model_w}x{model_h}")
 
@@ -352,7 +410,10 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         img_960p = np.array(Image.open(img_path).convert('RGB'))
         all_images_960p[idx] = img_960p
 
-        img_model = cv2.resize(img_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
+        if input_mode == "crop":
+            img_model, _, _, _ = resize_crop_to_rect(img_960p, model_h, model_w)
+        else:
+            img_model = cv2.resize(img_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
         all_images_model[idx] = img_model
 
         c2w = np.array(frame_data['transform_matrix'], dtype=np.float32)
@@ -386,8 +447,8 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         current_extrinsics = np.stack([all_extrinsics[idx] for idx in current_indices], axis=0)  # (7,4,4)
         current_intrinsics = np.stack([scaled_intrinsic_model] * num_total, axis=0)               # (7,3,3)
 
-        # Compute plucker raymap
-        raymap = prepare_raymap(
+        # Compute plucker raymap and normalized camera params
+        raymap, camera_poses_norm, intrinsics_tensor = prepare_raymap(
             current_extrinsics, current_intrinsics,
             context_indices, target_indices,
             model_h, model_w,
@@ -395,7 +456,7 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         raymap = raymap.to("cuda", dtype=torch.bfloat16)
 
         # Run inference
-        video = pipe(
+        pipe_kwargs = dict(
             prompt="",
             negative_prompt="",
             input_image=context_images,
@@ -411,6 +472,13 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             tiled=True,
         )
 
+        if args.use_prope:
+            pipe_kwargs["use_prope"] = True
+            pipe_kwargs["camera_poses_norm"] = camera_poses_norm.to("cuda", dtype=torch.bfloat16)
+            pipe_kwargs["intrinsics"] = intrinsics_tensor.to("cuda", dtype=torch.bfloat16)
+
+        video = pipe(**pipe_kwargs)
+
         # Extract generated target frame (last frame)
         pred_pil = video[-1]
         pred_frame = np.array(pred_pil)
@@ -419,9 +487,12 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         generated_frame_path = os.path.join(output_dir, f"generated_frame_{target_frame_idx:04d}_{model_h}x{model_w}.png")
         pred_pil.save(generated_frame_path)
 
-        # Resize GT to generation (model) resolution first, then resize+crop to eval_size
+        # Resize GT to generation (model) resolution, matching input_mode
         gt_frame_960p = all_images_960p[target_frame_idx]
-        gt_frame_model_res = cv2.resize(gt_frame_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
+        if input_mode == "crop":
+            gt_frame_model_res, _, _, _ = resize_crop_to_rect(gt_frame_960p, model_h, model_w)
+        else:
+            gt_frame_model_res = cv2.resize(gt_frame_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
 
         # Resize and center crop both to eval_size for metrics
         pred_frame_eval = resize_and_center_crop(pred_frame, eval_size)
@@ -685,9 +756,17 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=336, help="Model input width (training resolution)")
     parser.add_argument("--eval_size", type=int, default=576,
                         help="Evaluation size for center-crop metrics (default: 576)")
+    parser.add_argument("--input_mode", type=str, default="crop", choices=["stretch", "crop"],
+                        help="How to fit images to model resolution: "
+                             "'stretch' distorts to exact (h,w); "
+                             "'crop' resizes to cover then center-crops (preserves aspect ratio). "
+                             "Intrinsics are adjusted accordingly.")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--use_prope", action="store_true", default=False,
+                        help="Enable PRoPE (Projective Positional Encoding) in attention. "
+                             "Requires checkpoint trained with --use_prope.")
 
     # Metrics
     parser.add_argument("--use_dreamsim", action="store_true", help="Compute DreamSim metric")

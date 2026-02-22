@@ -7,9 +7,9 @@ accelerate launch --config_file my_config.yaml model_training/train_SE.py \
   --dataset_repeat 1 \
   --model_id_with_origin_paths "Wan-AI/Wan2.1-I2V-14B-480P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-480P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-480P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-480P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
   --learning_rate 1e-4 \
-  --num_epochs 21 \
+  --num_epochs 40 \
   --remove_prefix_in_ckpt "pipe.dit." \
-  --output_path "./models/train/Wan2.1-SE-14B-lora32-6to1_resume" \
+  --output_path "./models/train/Wan2.1-SE-14B-lora32-6to1_2000" \
   --lora_base_model "dit" \
   --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
   --lora_rank 32 \
@@ -19,8 +19,10 @@ accelerate launch --config_file my_config.yaml model_training/train_SE.py \
   --gradient_accumulation_steps 1 \
   --initialize_model_on_cpu \
   --seperated_encoding \
-  --sampling_strategy "all_window" \
+  --sampling_strategy "prob_random" \
   --wandb_project "wan-se-14b" \
-  --wandb_run_name "lora32-6to1" \
-  --resume_checkpoint "./models/train/Wan2.1-SE-14B-lora32-6to1_resume/epoch-last.safetensors" 
+  --wandb_run_name "lora32-6to1-2000" \
+  --num_dataset_samples 2000 \
+  # --save_steps 500 \
+  # --resume_checkpoint "./models/train/Wan2.1-SE-14B-lora32-6to1_250/epoch-last-104.safetensors" \
 

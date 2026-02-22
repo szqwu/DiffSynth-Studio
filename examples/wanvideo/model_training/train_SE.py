@@ -29,12 +29,19 @@ class WanTrainingModule(DiffusionTrainingModule):
         seperated_encoding=False,
         fuse_vae_embedding_in_latents_multiple=False,
         resume_checkpoint=None,
+        use_camera_adapter=False,
+        reverse_pred_order=False,
+        use_prope=False,
     ):
         super().__init__()
         # Warning
         if not use_gradient_checkpointing:
             warnings.warn("Gradient checkpointing is detected as disabled. To prevent out-of-memory errors, the training framework will forcibly enable gradient checkpointing.")
             use_gradient_checkpointing = True
+        
+        self.use_camera_adapter = use_camera_adapter
+        self.reverse_pred_order = reverse_pred_order
+        self.use_prope = use_prope
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
@@ -51,6 +58,32 @@ class WanTrainingModule(DiffusionTrainingModule):
             self.modify_model_channels(self.pipe.dit, new_in_dim, device)
             if self.pipe.dit2 is not None:
                 self.modify_model_channels(self.pipe.dit2, new_in_dim, device)
+        
+        # Camera adapter mode: use the pretrained SimpleAdapter from the checkpoint.
+        # If the checkpoint doesn't have one, create a new (randomly initialized) adapter.
+        # Must happen BEFORE split_pipeline_units so the adapter is on the model.
+        if use_camera_adapter:
+            if self.pipe.dit.control_adapter is not None:
+                print("Using pretrained control_adapter from checkpoint (not re-initializing)")
+            else:
+                self.add_camera_adapter(self.pipe.dit, device)
+            if self.pipe.dit2 is not None:
+                if self.pipe.dit2.control_adapter is not None:
+                    print("Using pretrained control_adapter from dit2 checkpoint")
+                else:
+                    self.add_camera_adapter(self.pipe.dit2, device)
+            # Set seperated_encoding flag on the pretrained model
+            # (not done by modify_model_channels since we don't modify channels)
+            if seperated_encoding:
+                self.pipe.dit.seperated_encoding = True
+                if self.pipe.dit2 is not None:
+                    self.pipe.dit2.seperated_encoding = True
+        
+        # Set reverse_pred_order flag on dit model (independent of camera adapter mode)
+        if reverse_pred_order:
+            self.pipe.dit.reverse_pred_order = True
+            if self.pipe.dit2 is not None:
+                self.pipe.dit2.reverse_pred_order = True
         
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
@@ -69,18 +102,33 @@ class WanTrainingModule(DiffusionTrainingModule):
         if modify_channels and new_in_dim is not None and lora_base_model is not None:
             self.unfreeze_patch_embedding(self.pipe, lora_base_model)
 
-        # Resume: load patch_embedding weights from checkpoint
-        # (mapping_lora_state_dict only keeps lora_A/lora_B keys, so patch_embedding
+        # If camera adapter mode, unfreeze the control_adapter for training
+        # if use_camera_adapter and lora_base_model is not None:
+        #     self.unfreeze_control_adapter(self.pipe, lora_base_model)
+
+        # If camera adapter is frozen, offload it to CPU to save GPU memory.
+        # The patchify method will move it to GPU on-the-fly for each forward pass.
+        if use_camera_adapter and lora_base_model is not None:
+            model = getattr(self.pipe, lora_base_model, None)
+            if model is not None and hasattr(model, 'control_adapter') and model.control_adapter is not None:
+                adapter_trainable = any(p.requires_grad for p in model.control_adapter.parameters())
+                if not adapter_trainable:
+                    model.control_adapter.to("cpu")
+                    print(f"Offloaded frozen control_adapter to CPU to save GPU memory")
+
+        # Resume: load patch_embedding / control_adapter weights from checkpoint
+        # (mapping_lora_state_dict only keeps lora_A/lora_B keys, so these
         #  weights are dropped during the LoRA loading above — restore them here)
         if resume_checkpoint is not None and lora_base_model is not None:
             from diffsynth.core import load_state_dict as _load_sd
             ckpt_sd = _load_sd(resume_checkpoint)
-            patch_emb_state = {k: v for k, v in ckpt_sd.items() if "patch_embedding" in k}
-            if patch_emb_state:
-                load_result = getattr(self.pipe, lora_base_model).load_state_dict(patch_emb_state, strict=False)
-                print(f"Resume: loaded {len(patch_emb_state)} patch_embedding keys from {resume_checkpoint}")
+            extra_state = {k: v for k, v in ckpt_sd.items()
+                          if "patch_embedding" in k or "control_adapter" in k}
+            if extra_state:
+                load_result = getattr(self.pipe, lora_base_model).load_state_dict(extra_state, strict=False)
+                print(f"Resume: loaded {len(extra_state)} extra keys (patch_embedding/control_adapter) from {resume_checkpoint}")
             else:
-                print(f"Resume warning: no patch_embedding keys found in {resume_checkpoint}")
+                print(f"Resume warning: no patch_embedding/control_adapter keys found in {resume_checkpoint}")
             del ckpt_sd
         
         # Store other configs
@@ -116,6 +164,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         old_out_dim = model.out_dim
         new_out_dim = old_out_dim
         
+        # Preserve control_adapter if the pretrained model has one
+        has_adapter = model.control_adapter is not None
+        
         # Get the old configuration
         from diffsynth.models.wan_video_dit import WanModel
         
@@ -134,16 +185,15 @@ class WanTrainingModule(DiffusionTrainingModule):
             has_image_input=model.has_image_input,
             has_image_pos_emb=model.has_image_pos_emb,
             has_ref_conv=model.has_ref_conv,
-            # add_control_adapter=model.control_adapter is not None,
-            add_control_adapter=None,
-            # in_dim_control_adapter=24 if model.control_adapter is not None else 24,
-            in_dim_control_adapter=None,
+            add_control_adapter=has_adapter,
+            in_dim_control_adapter=24 if has_adapter else None,
             seperated_timestep=model.seperated_timestep,
             require_vae_embedding=model.require_vae_embedding,
             require_clip_embedding=model.require_clip_embedding,
             fuse_vae_embedding_in_latents=model.fuse_vae_embedding_in_latents,
             fuse_vae_embedding_in_latents_multiple = self.fuse_vae_embedding_in_latents_multiple,
             seperated_encoding=self.seperated_encoding,
+            reverse_pred_order=self.reverse_pred_order,
         )
         
         # Load all pretrained weights EXCEPT layers with modified dimensions
@@ -175,6 +225,27 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         print(f"Model input channels modified: in_dim {old_in_dim}->{new_in_dim} (out_dim unchanged: {old_out_dim})")
     
+    def add_camera_adapter(self, model, device):
+        """
+        Add a randomly-initialized SimpleAdapter (camera control adapter) to the model.
+        The patchify layer is NOT modified — camera conditioning enters via additive
+        injection after patch embedding, just like the Fun Camera Control pipeline.
+        """
+        if model is None:
+            return
+        from diffsynth.models.wan_video_camera_controller import SimpleAdapter
+        # 24 = 6 Plucker channels × 4 temporal packing (SE repeat-4 convention)
+        adapter = SimpleAdapter(
+            in_dim=24,
+            out_dim=model.dim,
+            kernel_size=model.patch_size[1:],
+            stride=model.patch_size[1:],
+        )
+        adapter = adapter.to(device=device, dtype=torch.bfloat16)
+        model.control_adapter = adapter
+        print(f"Added SimpleAdapter camera control adapter to model "
+              f"(in_dim=24, out_dim={model.dim}, kernel={model.patch_size[1:]})")
+
     def unfreeze_patch_embedding(self, pipe, lora_base_model):
         """
         Unfreeze the patch_embedding layer for training since it was randomly initialized
@@ -197,6 +268,27 @@ class WanTrainingModule(DiffusionTrainingModule):
                 for param in pipe.dit2.patch_embedding.parameters():
                     param.requires_grad = True
                 print(f"Unfroze patch_embedding layer in dit2 for full training")
+
+    def unfreeze_control_adapter(self, pipe, lora_base_model):
+        """
+        Unfreeze the control_adapter (SimpleAdapter) for training.
+        Called after switch_pipe_to_training_mode which freezes everything except LoRA params.
+        """
+        model = getattr(pipe, lora_base_model, None)
+        if model is None:
+            return
+        if hasattr(model, 'control_adapter') and model.control_adapter is not None:
+            model.control_adapter.train()
+            for param in model.control_adapter.parameters():
+                param.requires_grad = True
+            print(f"Unfroze control_adapter in {lora_base_model} for full training")
+        # Handle dit2 as well
+        if lora_base_model == "dit" and hasattr(pipe, 'dit2') and pipe.dit2 is not None:
+            if hasattr(pipe.dit2, 'control_adapter') and pipe.dit2.control_adapter is not None:
+                pipe.dit2.control_adapter.train()
+                for param in pipe.dit2.control_adapter.parameters():
+                    param.requires_grad = True
+                print(f"Unfroze control_adapter in dit2 for full training")
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -213,12 +305,19 @@ class WanTrainingModule(DiffusionTrainingModule):
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {}
+        # Determine whether camera_poses_norm and intrinsics should be passed through
+        # They are needed for: camera_adapter (SimpleAdapter) and/or prope (attention-level encoding)
+        need_camera_params = self.use_camera_adapter or self.use_prope
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
             "input_image": data["input_images"],
             "input_video": data["target_images"],
-            "raymap": data["raymap"],
+            # Camera conditioning: either raymap (channel concat) or poses+intrinsics (SimpleAdapter/PRoPE)
+            "raymap": None if self.use_camera_adapter else data["raymap"],
+            "camera_poses_norm": data.get("camera_poses_norm", None) if need_camera_params else None,
+            "intrinsics": data.get("intrinsics", None) if need_camera_params else None,
+            "use_prope": self.use_prope,
             "height": data["input_images"][0].size[1],
             "width": data["input_images"][0].size[0],
             "num_frames": len(data["target_images"]),
@@ -272,6 +371,24 @@ def wan_parser():
                              "prob_random (80%% full / 20%% window [24,48]), "
                              "all_window (always [24,48] window), "
                              "curriculum (first half epochs window, second half random).")
+    parser.add_argument("--use_camera_adapter", default=False, action="store_true",
+                        help="Use SimpleAdapter (Fun Camera Control style) for camera conditioning "
+                             "instead of channel concatenation. When set, the patchify layer is NOT "
+                             "modified; the pretrained SimpleAdapter from the checkpoint is finetuned "
+                             "alongside LoRA. If the checkpoint has no adapter, a new one is created. "
+                             "Mutually exclusive with --modify_channels.")
+    parser.add_argument("--reverse_pred_order", default=False, action="store_true",
+                        help="Reverse the frame order so the FIRST frame is the prediction target "
+                             "and the remaining frames are context. By default (False), the LAST "
+                             "frame is the prediction target. Affects dataset ordering, condition "
+                             "embedding mask, pose normalization, and loss masking.")
+    parser.add_argument("--use_prope", default=False, action="store_true",
+                        help="Use PRoPE (Projective Positional Encoding) for camera-geometry-aware "
+                             "attention. Replaces 3D grid RoPE with camera-relative positional "
+                             "encoding in self-attention. Requires camera_poses_norm and intrinsics "
+                             "from the dataset. Can be combined with raymap channel concat or "
+                             "SimpleAdapter for token-level camera conditioning.")
+    parser.add_argument("--num_dataset_samples", type=int, default=1000, help="Number of dataset samples to use for training.")
     return parser
 
 
@@ -294,6 +411,8 @@ if __name__ == "__main__":
         time_division_factor=4,
         time_division_remainder=1,
         sampling_strategy=args.sampling_strategy,
+        reverse_pred_order=args.reverse_pred_order,
+        num_dataset_samples=args.num_dataset_samples,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -321,6 +440,9 @@ if __name__ == "__main__":
         seperated_encoding=args.seperated_encoding,
         fuse_vae_embedding_in_latents_multiple=args.fuse_vae_embedding_in_latents_multiple,
         resume_checkpoint=args.resume_checkpoint,
+        use_camera_adapter=args.use_camera_adapter,
+        reverse_pred_order=args.reverse_pred_order,
+        use_prope=args.use_prope,
     )
     model_logger = ModelLogger(
         args.output_path,
