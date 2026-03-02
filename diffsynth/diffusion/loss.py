@@ -37,6 +37,7 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
         noise_pred = noise_pred[:, :, -1:]
         training_target = training_target[:, :, -1:]
         # print(f"noise_pred.shape: {noise_pred.shape}")
+    # print(f"noise_pred.shape: {noise_pred.shape}")
     
     if "mask_loss_first" in inputs:
         noise_pred = noise_pred[:, :, :1]

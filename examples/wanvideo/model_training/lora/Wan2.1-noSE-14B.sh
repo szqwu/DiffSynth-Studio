@@ -1,0 +1,26 @@
+accelerate launch --config_file my_config.yaml model_training/train_noSE.py \
+  --dataset_base_path ../../../DL3DV-10K_960P/1K \
+  --dataset_metadata_path ../../../DL3DV-10K_960P/1K \
+  --height 192 \
+  --width 336 \
+  --num_frames 7 \
+  --dataset_repeat 1 \
+  --model_id_with_origin_paths "Wan-AI/Wan2.1-I2V-14B-480P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-480P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-480P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-480P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+  --learning_rate 1e-4 \
+  --num_epochs 160 \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path "./models/train/Wan2.1-noSE-14B-lora32-6to1_1000" \
+  --lora_base_model "dit" \
+  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
+  --lora_rank 32 \
+  --extra_inputs "input_image" \
+  --modify_channels \
+  --new_in_dim 1572 \
+  --gradient_accumulation_steps 1 \
+  --initialize_model_on_cpu \
+  --no_SE \
+  --sampling_strategy "prob_random" \
+  --wandb_project "wan-noSE-14b" \
+  --wandb_run_name "lora32-6to1-noSE-1000" \
+  --num_dataset_samples 1000 \
+  --save_steps 1000

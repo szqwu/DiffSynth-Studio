@@ -175,11 +175,36 @@ def compute_dreamsim(dreamsim_model, dreamsim_preprocess, pred, gt):
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def save_comparison_image(gt_img, pred_img, frame_idx, psnr, ssim_val, lpips_val, ds_val,
+                          save_path, eval_size):
+    """Save a side-by-side GT vs Pred comparison image with metrics at the bottom."""
+    bar_h = 40
+    gap = 10
+    canvas_w = eval_size * 2 + gap
+    canvas_h = eval_size + bar_h
+    comp = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+
+    comp[:eval_size, :eval_size] = gt_img
+    comp[:eval_size, eval_size + gap:] = pred_img
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(comp, "GT", (10, 30), font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+    cv2.putText(comp, "Pred", (eval_size + gap + 10, 30), font, 0.7, (0, 200, 200), 2, cv2.LINE_AA)
+
+    metrics_txt = (f"Frame {frame_idx}:  PSNR={psnr:.2f}  SSIM={ssim_val:.4f}  "
+                   f"LPIPS={lpips_val:.4f}  DreamSim={ds_val:.4f}")
+    cv2.putText(comp, metrics_txt, (10, eval_size + 28), font, 0.5,
+                (0, 0, 0), 1, cv2.LINE_AA)
+
+    Image.fromarray(comp).save(save_path)
+
+
 def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
-                  ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess):
+                  ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess,
+                  save_comparisons=False):
     """
     Process a single SEVA scene: load GT & pred, apply SEVA crop → resize to
-    192x192, compute all four metrics.
+    EVAL_SIZE x EVAL_SIZE, compute all four metrics.
 
     Returns dict with per-frame and mean metrics, or None on failure.
     """
@@ -206,6 +231,12 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
 
     with open(transforms_file, "r") as f:
         transforms_data = json.load(f)
+
+    # ── Comparison output dir ─────────────────────────────────────────────
+    comp_dir = None
+    if save_comparisons:
+        comp_dir = os.path.join(scene_dir, f"comparisons_{EVAL_SIZE}x{EVAL_SIZE}")
+        os.makedirs(comp_dir, exist_ok=True)
 
     # ── Compute metrics per frame ─────────────────────────────────────────
     psnrs, ssims, lpipss, dreamsims = [], [], [], []
@@ -247,6 +278,18 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
             "lpips": lpips_val,
             "dreamsim": ds_val,
         })
+
+        if comp_dir is not None:
+            save_comparison_image(
+                gt_img, pred_img, frame_idx,
+                psnr, ssim_val, lpips_val, ds_val,
+                os.path.join(comp_dir, f"comparison_{frame_idx:04d}.png"),
+                EVAL_SIZE,
+            )
+            Image.fromarray(gt_img).save(
+                os.path.join(comp_dir, f"gt_{frame_idx:04d}.png"))
+            Image.fromarray(pred_img).save(
+                os.path.join(comp_dir, f"pred_{frame_idx:04d}.png"))
 
     if not psnrs:
         print(f"  [SKIP] No valid frames for scene {scene_hash}")
@@ -295,6 +338,11 @@ def main():
         "--output_json", type=str, default=None,
         help="Path to save per-frame JSON results (optional, defaults to <results_dir>/scores_480x480.json)",
     )
+    parser.add_argument(
+        "--save_comparisons", action="store_true",
+        help="Save side-by-side GT vs Pred comparison images (EVAL_SIZE x EVAL_SIZE) "
+             "with per-frame metrics into a subfolder under each scene directory.",
+    )
     args = parser.parse_args()
 
     results_dir = args.results_dir
@@ -332,6 +380,7 @@ def main():
             scene_hash, results_dir,
             args.dl3dv_meta_path, args.dl3dv_data_path,
             ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess,
+            save_comparisons=args.save_comparisons,
         )
         if result is not None:
             all_results.append(result)

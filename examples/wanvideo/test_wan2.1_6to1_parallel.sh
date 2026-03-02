@@ -4,8 +4,8 @@
 # Processes scenes in parallel across 5 GPUs, 2 scenes per GPU
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-39.safetensors"
-output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-39"
+checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-69-new.safetensors"
+output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-69-new"
 GPU_IDS=( 0 1 2 3 4)
 # GPU_IDS=(  7 )
 SCENES_PER_GPU=2

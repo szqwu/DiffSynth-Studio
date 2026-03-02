@@ -126,7 +126,7 @@ def raymap_to_plucker(raymap: Tensor) -> Tensor:
     plucker_normal = torch.cross(ray_origins, ray_directions, dim=-1)
     return torch.cat([ray_directions, plucker_normal], dim=-1)
 
-def get_plucker_rays(pose, intrinsic, height, width, downsample_factor=8):
+def get_plucker_rays(pose, intrinsic, height, width, no_pixel_unshuffle=False, downsample_factor=8):
     """
     Compute Plucker ray maps for pose_in relative to pose_out (query pose).
     
@@ -143,10 +143,12 @@ def get_plucker_rays(pose, intrinsic, height, width, downsample_factor=8):
     raymap = camera_to_raymap(intrinsic, pose, height=height, width=width, downscale=downscale_factor)
     plucker_ray_map = raymap_to_plucker(raymap)
     plucker_ray_map_permuted = plucker_ray_map.permute(0, 3, 1, 2)
-    pixel_unshuffle = torch.nn.PixelUnshuffle(downscale_factor=downsample_factor)
-    plucker_ray_map_permuted_unshuffled = pixel_unshuffle(plucker_ray_map_permuted)
+    if not no_pixel_unshuffle:
+        pixel_unshuffle = torch.nn.PixelUnshuffle(downscale_factor=downsample_factor)
+        plucker_ray_map_permuted_unshuffled = pixel_unshuffle(plucker_ray_map_permuted)
     # interpolate to 1/8 resolution
-    # plucker_ray_map_permuted_unshuffled = F.interpolate(plucker_ray_map_permuted, scale_factor=1/8, mode='bilinear', align_corners=False)
+    else:
+        plucker_ray_map_permuted_unshuffled = F.interpolate(plucker_ray_map_permuted, scale_factor=1/8, mode='bilinear', align_corners=False)
 
     return plucker_ray_map_permuted_unshuffled
 
@@ -369,6 +371,7 @@ class my_cognvs_dataset(Dataset):
             sampling_strategy="prob_random",
             reverse_pred_order=False,
             num_dataset_samples=1000,
+            no_pixel_unshuffle=False,
         ):
 
         self.base_path = base_path
@@ -381,6 +384,7 @@ class my_cognvs_dataset(Dataset):
         self.width_division_factor = width_division_factor
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
+        self.no_pixel_unshuffle = no_pixel_unshuffle
         self.load_from_cache = False  # This dataset doesn't use cached data
         self.reverse_pred_order = reverse_pred_order
 
@@ -403,6 +407,24 @@ class my_cognvs_dataset(Dataset):
         self.video_list_dl3dv_2k_path = '/data2/qiwu2/2K'
         self.video_list_dl3dv_2k = [os.path.join(self.video_list_dl3dv_2k_path, f, "images_4") for f in os.listdir(self.video_list_dl3dv_2k_path) if os.path.isdir(os.path.join(self.video_list_dl3dv_2k_path, f))]
         self.video_list_dl3dv = self.video_list_dl3dv + self.video_list_dl3dv_2k
+
+        # # Filter out scenes whose transforms.json has too few frames for windowed sampling
+        # MIN_CAMERA_FRAMES = 48
+        # filtered = []
+        # for v in self.video_list_dl3dv:
+        #     tf_path = v.replace("images_4", "transforms.json")
+        #     if os.path.exists(tf_path):
+        #         try:
+        #             with open(tf_path, 'r') as f:
+        #                 nf = len(json.load(f).get('frames', []))
+        #             if nf < MIN_CAMERA_FRAMES:
+        #                 print(f"Skipping {v}: transforms.json has only {nf} frames")
+        #                 continue
+        #         except Exception:
+        #             pass
+        #     filtered.append(v)
+        # self.video_list_dl3dv = filtered
+
         self.video_list = self.video_list_dl3dv[:num_dataset_samples]
         self.video_list.sort()
         print(f"Total number of videos: {len(self.video_list)}")
@@ -579,6 +601,8 @@ class my_cognvs_dataset(Dataset):
                 seperate_encoding_num_samples = num_frames
         else:
             seperate_encoding_num_samples = num_frames
+        # Clamp to valid range: must not exceed available frames and must be >= self.num_frames
+        seperate_encoding_num_samples = max(self.num_frames, min(seperate_encoding_num_samples, num_frames))
         start_idx = random.randint(0, num_frames - seperate_encoding_num_samples)
         sampled_indices = list(range(start_idx, start_idx + seperate_encoding_num_samples))
 
@@ -653,7 +677,7 @@ class my_cognvs_dataset(Dataset):
                 # Normalize to last camera (the prediction target)
                 _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
 
-            raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width)
+            raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width, no_pixel_unshuffle=self.no_pixel_unshuffle)
             # print(f"raymaps shape: {raymaps.shape}")
             # Convert to torch tensor if it's numpy
             if isinstance(raymaps, np.ndarray):

@@ -33,11 +33,12 @@ import torch
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration (must match test_wan2.1_6to1.py exactly)
 # ──────────────────────────────────────────────────────────────────────────────
-# MODEL_H = 192
-# MODEL_W = 336
-MODEL_H = 480
-MODEL_W = 720
-DEFAULT_EVAL_SIZE = 576
+MODEL_H = 192
+MODEL_W = 336
+DEFAULT_EVAL_SIZE = 192
+# MODEL_H = 480
+# MODEL_W = 832
+# DEFAULT_EVAL_SIZE = 480
 
 # DL3DV-10K data paths (same defaults as test_wan2.1_6to1.py)
 DEFAULT_DL3DV_META_PATH = "/data2/qiwu2/dl3dv10"
@@ -202,12 +203,40 @@ def compute_dreamsim(dreamsim_model, dreamsim_preprocess, pred, gt):
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def save_comparison_image(gt_crop, pred_crop, frame_idx, psnr, ssim_val, lpips_val, ds_val,
+                          save_path, eval_size=None):
+    """Save a side-by-side GT vs Pred comparison image with metrics at the bottom."""
+    img_h, img_w = gt_crop.shape[:2]
+    bar_h = 40
+    gap = 10
+    canvas_w = img_w * 2 + gap
+    canvas_h = img_h + bar_h
+    comp = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+
+    comp[:img_h, :img_w] = gt_crop
+    comp[:img_h, img_w + gap:] = pred_crop
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(comp, "GT", (10, 30), font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+    cv2.putText(comp, "Pred", (img_w + gap + 10, 30), font, 0.7, (0, 200, 200), 2, cv2.LINE_AA)
+
+    metrics_txt = (f"Frame {frame_idx}:  PSNR={psnr:.2f}  SSIM={ssim_val:.4f}  "
+                   f"LPIPS={lpips_val:.4f}  DreamSim={ds_val:.4f}")
+    cv2.putText(comp, metrics_txt, (10, img_h + 28), font, 0.5,
+                (0, 0, 0), 1, cv2.LINE_AA)
+
+    Image.fromarray(comp).save(save_path)
+
+
 def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
                   ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess,
-                  mode="crop", eval_size=DEFAULT_EVAL_SIZE):
+                  mode="crop", eval_size=DEFAULT_EVAL_SIZE, save_comparisons=False,
+                  no_center_crop=False):
     """
     Process a single scene: load GT (via crop or stretch) & pred,
-    resize_and_center_crop both to eval_size x eval_size, compute all metrics.
+    optionally resize_and_center_crop both to eval_size x eval_size, compute all metrics.
+
+    If no_center_crop=True, evaluate at full MODEL_H x MODEL_W without cropping to square.
 
     Returns dict with per-frame and mean metrics, or None on failure.
     """
@@ -235,6 +264,13 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
     with open(transforms_file, "r") as f:
         transforms_data = json.load(f)
 
+    # ── Comparison output dir ─────────────────────────────────────────────
+    comp_dir = None
+    if save_comparisons:
+        tag = f"full_{MODEL_H}x{MODEL_W}" if no_center_crop else f"{eval_size}x{eval_size}"
+        comp_dir = os.path.join(scene_dir, f"comparisons_{mode}_{tag}")
+        os.makedirs(comp_dir, exist_ok=True)
+
     # ── Compute metrics per frame ─────────────────────────────────────────
     psnrs, ssims, lpipss, dreamsims = [], [], [], []
     per_frame = []
@@ -252,9 +288,12 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
         assert gt_img.shape == (MODEL_H, MODEL_W, 3), f"GT shape mismatch: {gt_img.shape}"
         assert pred_img.shape == (MODEL_H, MODEL_W, 3), f"Pred shape mismatch: {pred_img.shape}"
 
-        # Resize and center crop both to eval_size x eval_size for evaluation
-        gt_crop = resize_and_center_crop(gt_img, eval_size)
-        pred_crop = resize_and_center_crop(pred_img, eval_size)
+        if no_center_crop:
+            gt_crop = gt_img
+            pred_crop = pred_img
+        else:
+            gt_crop = resize_and_center_crop(gt_img, eval_size)
+            pred_crop = resize_and_center_crop(pred_img, eval_size)
 
         # PSNR
         psnr = compute_psnr(pred_crop, gt_crop)
@@ -279,6 +318,18 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
             "lpips": lpips_val,
             "dreamsim": ds_val,
         })
+
+        if comp_dir is not None:
+            save_comparison_image(
+                gt_crop, pred_crop, frame_idx,
+                psnr, ssim_val, lpips_val, ds_val,
+                os.path.join(comp_dir, f"comparison_{frame_idx:04d}.png"),
+                eval_size,
+            )
+            Image.fromarray(gt_crop).save(
+                os.path.join(comp_dir, f"gt_{frame_idx:04d}.png"))
+            Image.fromarray(pred_crop).save(
+                os.path.join(comp_dir, f"pred_{frame_idx:04d}.png"))
 
     if not psnrs:
         print(f"  [SKIP] No valid frames for scene {scene_hash}")
@@ -310,7 +361,9 @@ def main():
     )
     parser.add_argument(
         "--results_dir", type=str,
-        default="/data2/qiwu2/dl3dv_test_results_10000",
+        default="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-59-new",
+        # default="/data2/qiwu2/dl3dv_test_results_wan21_6to1_no-shuffle_epoch-79",
+        # default="/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_79",
         help="Path to the results directory generated by test_wan2.1_6to1.sh",
     )
     parser.add_argument(
@@ -324,7 +377,7 @@ def main():
         help="Path to DL3DV-10K test data (contains nerfstudio/ per scene)",
     )
     parser.add_argument(
-        "--mode", type=str, choices=["crop", "stretch"], default="stretch",
+        "--mode", type=str, choices=["crop", "stretch"], default="crop",
         help="How to load GT from original resolution to model resolution: "
              "'crop' = center-crop to match aspect ratio then resize (default), "
              "'stretch' = directly resize (may distort)",
@@ -339,13 +392,30 @@ def main():
         help="Path to save per-frame JSON results (optional, defaults to "
              "<results_dir>/scores_<mode>_<eval_size>x<eval_size>.json)",
     )
+    parser.add_argument(
+        "--no_center_crop", action="store_true",
+        help="Skip the center-crop-to-square step and evaluate at the full generated "
+             f"resolution ({MODEL_H}x{MODEL_W}). Overrides --eval_size.",
+    )
+    parser.add_argument(
+        "--save_comparisons", action="store_true",
+        help="Save side-by-side GT vs Pred comparison images (eval_size x eval_size) "
+             "with per-frame metrics into a subfolder under each scene directory.",
+    )
     args = parser.parse_args()
 
     results_dir = args.results_dir
     mode = args.mode
+    no_center_crop = args.no_center_crop
     eval_size = args.eval_size
+
+    if no_center_crop:
+        eval_tag = f"full_{MODEL_H}x{MODEL_W}"
+    else:
+        eval_tag = f"{eval_size}x{eval_size}"
+
     if args.output_json is None:
-        args.output_json = os.path.join(results_dir, f"scores_{mode}_{eval_size}x{eval_size}.json")
+        args.output_json = os.path.join(results_dir, f"scores_{mode}_{eval_tag}.json")
 
     # ── Discover scenes ───────────────────────────────────────────────────
     scene_hashes = sorted([
@@ -353,7 +423,10 @@ def main():
         if os.path.isdir(os.path.join(results_dir, d))
     ])
     print(f"Found {len(scene_hashes)} scenes in {results_dir}")
-    print(f"Evaluation mode: {mode}  {MODEL_H}x{MODEL_W} → {eval_size}x{eval_size}")
+    if no_center_crop:
+        print(f"Evaluation mode: {mode}  {MODEL_H}x{MODEL_W} (full resolution, no center crop)")
+    else:
+        print(f"Evaluation mode: {mode}  {MODEL_H}x{MODEL_W} → {eval_size}x{eval_size}")
 
     # ── Initialize metric models ──────────────────────────────────────────
     print("\nInitializing metrics...")
@@ -377,6 +450,8 @@ def main():
             args.dl3dv_meta_path, args.dl3dv_data_path,
             ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess,
             mode=mode, eval_size=eval_size,
+            save_comparisons=args.save_comparisons,
+            no_center_crop=no_center_crop,
         )
         if result is not None:
             all_results.append(result)
@@ -388,7 +463,7 @@ def main():
     # ── Overall summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 80}")
     print(f"OVERALL RESULTS  ({len(all_results)} scenes, "
-          f"{mode} {MODEL_H}x{MODEL_W} → {eval_size}x{eval_size})")
+          f"{mode} {MODEL_H}x{MODEL_W} → {eval_tag})")
     print(f"{'=' * 80}")
 
     if all_psnr:
@@ -415,7 +490,8 @@ def main():
             "results_dir": results_dir,
             "model_resolution": f"{MODEL_H}x{MODEL_W}",
             "eval_mode": mode,
-            "eval_size": f"{eval_size}x{eval_size}",
+            "eval_size": eval_tag,
+            "no_center_crop": no_center_crop,
             "dl3dv_meta_path": args.dl3dv_meta_path,
             "dl3dv_data_path": args.dl3dv_data_path,
         },
@@ -439,9 +515,9 @@ def main():
     print(f"\nResults saved to {args.output_json}")
 
     # ── Also save a concise summary text file ─────────────────────────────
-    summary_path = os.path.join(results_dir, f"scores_{mode}_{eval_size}x{eval_size}_summary.txt")
+    summary_path = os.path.join(results_dir, f"scores_{mode}_{eval_tag}_summary.txt")
     with open(summary_path, "w") as f:
-        f.write(f"Evaluation: {mode} {MODEL_H}x{MODEL_W} → {eval_size}x{eval_size}\n")
+        f.write(f"Evaluation: {mode} {MODEL_H}x{MODEL_W} → {eval_tag}\n")
         f.write(f"Results dir: {results_dir}\n\n")
         if all_psnr:
             f.write(f"Mean PSNR:     {np.mean(all_psnr):.2f} ± {np.std(all_psnr):.2f} dB\n")

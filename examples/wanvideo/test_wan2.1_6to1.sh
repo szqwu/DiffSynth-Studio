@@ -3,21 +3,26 @@
 # Script to run Wan2.1 6-to-1 NVS evaluation on DL3DV-10K scenes
 # Processes all scenes sequentially on a single GPU
 
-# ── Mode: "standard" or "prope" ───────────────────────────────────────────────
-MODE="${1:-prope}"
+# ── Mode: "standard", "prope", or "zero_temporal_rope" ────────────────────────
+# MODE="${1:-prope}"
+MODE="${1:-standard}"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 if [ "$MODE" = "prope" ]; then
     checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_prope/epoch-39.safetensors"
     output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_prope-119"
     EXTRA_ARGS="--use_prope"
+elif [ "$MODE" = "zero_temporal_rope" ]; then
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope_2/epoch-79.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_2_79"
+    EXTRA_ARGS="--zero_temporal_rope"
 else
     # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_curriculum/epoch-79.safetensors"
-    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-19.safetensors"
-    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-19_192p"
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_250_3/step-2560.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_250_3_2560"
     EXTRA_ARGS=""
 fi
-GPU_ID=5
+GPU_ID=4
 
 # All 10 DL3DV-10K test scenes
 SCENES=(
@@ -29,6 +34,10 @@ SCENES=(
     "cd9c981eeb4a9091547af19181b382698e9d9eee0a838c7c9783a8a268af6aee"
     "d4fbeba0168af8fddb2fc695881787aedcd62f477c7dcec9ebca7b8594bbd95b"
     "e78f8cebd2bd93d960bfaeac18fac0bb2524f15c44288903cd20b73e599e8a81"
+    "ed16328235c610f15405ff08711eaf15d88a0503884f3a9ccb5a0ee69cb4acb5"
+    "f71ac346cd0fc4652a89afb37044887ec3907d37d01d1ceb0ad28e1a780d8e03"
+)
+SCENES=(
     "ed16328235c610f15405ff08711eaf15d88a0503884f3a9ccb5a0ee69cb4acb5"
     "f71ac346cd0fc4652a89afb37044887ec3907d37d01d1ceb0ad28e1a780d8e03"
 )

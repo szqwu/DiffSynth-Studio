@@ -169,7 +169,8 @@ def scale_intrinsics(intrinsics, orig_height, orig_width, target_height, target_
     return scaled
 
 
-def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, height, width):
+def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, height, width,
+                   no_pixel_unshuffle=False):
     """
     Normalize camera poses and compute plucker rays.
     Follows the exact same logic as cog-nvs test and the training dataset.
@@ -204,6 +205,7 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
         intrinsics_tensor,
         height=height,
         width=width,
+        no_pixel_unshuffle=no_pixel_unshuffle,
     )
     if isinstance(raymap, np.ndarray):
         raymap = torch.from_numpy(raymap).float()
@@ -452,6 +454,7 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             current_extrinsics, current_intrinsics,
             context_indices, target_indices,
             model_h, model_w,
+            no_pixel_unshuffle=args.no_pixel_unshuffle,
         )
         raymap = raymap.to("cuda", dtype=torch.bfloat16)
 
@@ -476,6 +479,9 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             pipe_kwargs["use_prope"] = True
             pipe_kwargs["camera_poses_norm"] = camera_poses_norm.to("cuda", dtype=torch.bfloat16)
             pipe_kwargs["intrinsics"] = intrinsics_tensor.to("cuda", dtype=torch.bfloat16)
+
+        if args.zero_temporal_rope:
+            pipe_kwargs["zero_temporal_rope"] = True
 
         video = pipe(**pipe_kwargs)
 
@@ -767,6 +773,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_prope", action="store_true", default=False,
                         help="Enable PRoPE (Projective Positional Encoding) in attention. "
                              "Requires checkpoint trained with --use_prope.")
+    parser.add_argument("--zero_temporal_rope", action="store_true", default=False,
+                        help="Zero out temporal RoPE (identity rotation for frame axis). "
+                             "Requires checkpoint trained with --zero_temporal_rope.")
+    parser.add_argument("--no_pixel_unshuffle", action="store_true", default=False,
+                        help="Use bilinear downsampling instead of PixelUnshuffle for raymaps. "
+                             "Must match the training --no_pixel_unshuffle flag.")
 
     # Metrics
     parser.add_argument("--use_dreamsim", action="store_true", help="Compute DreamSim metric")

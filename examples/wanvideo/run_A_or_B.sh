@@ -22,6 +22,8 @@ echo "============================================"
 echo "$(date): Starting 256x256 training attempt"
 echo "============================================"
 
+# /data2/qiwu2/vnice.sh bash model_training/lora/Wan2.1-SE-ZeroTemporalRoPE-14B.sh
+# bash model_training/lora/Wan2.1-SE-ZeroTemporalRoPE-14B.sh
 bash model_training/lora/Wan2.1-SE-14B.sh
 
 if [ $? -eq 0 ]; then

@@ -32,6 +32,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         use_camera_adapter=False,
         reverse_pred_order=False,
         use_prope=False,
+        zero_temporal_rope=False,
     ):
         super().__init__()
         # Warning
@@ -42,6 +43,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.use_camera_adapter = use_camera_adapter
         self.reverse_pred_order = reverse_pred_order
         self.use_prope = use_prope
+        self.zero_temporal_rope = zero_temporal_rope
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
@@ -318,6 +320,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "camera_poses_norm": data.get("camera_poses_norm", None) if need_camera_params else None,
             "intrinsics": data.get("intrinsics", None) if need_camera_params else None,
             "use_prope": self.use_prope,
+            "zero_temporal_rope": self.zero_temporal_rope,
             "height": data["input_images"][0].size[1],
             "width": data["input_images"][0].size[0],
             "num_frames": len(data["target_images"]),
@@ -388,7 +391,14 @@ def wan_parser():
                              "encoding in self-attention. Requires camera_poses_norm and intrinsics "
                              "from the dataset. Can be combined with raymap channel concat or "
                              "SimpleAdapter for token-level camera conditioning.")
+    parser.add_argument("--zero_temporal_rope", default=False, action="store_true",
+                        help="Zero out the temporal (frame) component of 3D RoPE by replacing "
+                             "temporal frequencies with identity (1+0j). Spatial (height/width) "
+                             "RoPE remains unchanged. This removes temporal position information "
+                             "so the model treats all frames as having the same temporal position.")
     parser.add_argument("--num_dataset_samples", type=int, default=1000, help="Number of dataset samples to use for training.")
+    parser.add_argument("--no_pixel_unshuffle", default=False, action="store_true",
+                        help="Do not use pixel unshuffle to downscale the raymap to 1/8 resolution.")
     return parser
 
 
@@ -413,6 +423,7 @@ if __name__ == "__main__":
         sampling_strategy=args.sampling_strategy,
         reverse_pred_order=args.reverse_pred_order,
         num_dataset_samples=args.num_dataset_samples,
+        no_pixel_unshuffle=args.no_pixel_unshuffle,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -443,6 +454,7 @@ if __name__ == "__main__":
         use_camera_adapter=args.use_camera_adapter,
         reverse_pred_order=args.reverse_pred_order,
         use_prope=args.use_prope,
+        zero_temporal_rope=args.zero_temporal_rope,
     )
     model_logger = ModelLogger(
         args.output_path,

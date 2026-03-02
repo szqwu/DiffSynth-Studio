@@ -404,6 +404,7 @@ class WanModel(torch.nn.Module):
                 viewmats: Optional[torch.Tensor] = None,
                 Ks: Optional[torch.Tensor] = None,
                 image_hw: Optional[Tuple[int, int]] = None,
+                zero_temporal_rope: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -418,8 +419,11 @@ class WanModel(torch.nn.Module):
         
         x, (f, h, w) = self.patchify(x)
         
+        f_freqs = self.freqs[0][:f]
+        if zero_temporal_rope:
+            f_freqs = torch.ones_like(f_freqs)
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
