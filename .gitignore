@@ -178,3 +178,4 @@ cython_debug/
 *.tar
 *.pth.tar
 *.zip
+examples/wanvideo/wandb/
