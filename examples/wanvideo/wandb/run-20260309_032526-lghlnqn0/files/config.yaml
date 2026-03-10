@@ -1,0 +1,258 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            2zbkfrf8n44emduomhajllpwgtpw4md9:
+                args:
+                    - --dataset_base_path
+                    - ../../../DL3DV-10K_960P/1K
+                    - --dataset_metadata_path
+                    - ../../../DL3DV-10K_960P/1K
+                    - --height
+                    - "192"
+                    - --width
+                    - "336"
+                    - --num_frames
+                    - "7"
+                    - --dataset_repeat
+                    - "1"
+                    - --model_id_with_origin_paths
+                    - Wan-AI/Wan2.1-I2V-14B-480P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-480P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-480P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-480P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+                    - --learning_rate
+                    - "1e-4"
+                    - --num_epochs
+                    - "80"
+                    - --remove_prefix_in_ckpt
+                    - pipe.dit.
+                    - --output_path
+                    - ./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context_2
+                    - --lora_base_model
+                    - dit
+                    - --lora_target_modules
+                    - q,k,v,o,ffn.0,ffn.2
+                    - --lora_rank
+                    - "32"
+                    - --extra_inputs
+                    - input_image
+                    - --modify_channels
+                    - --new_in_dim
+                    - "420"
+                    - --gradient_accumulation_steps
+                    - "1"
+                    - --initialize_model_on_cpu
+                    - --seperated_encoding
+                    - --sampling_strategy
+                    - prob_random
+                    - --wandb_project
+                    - wan-se-14b
+                    - --wandb_run_name
+                    - lora32-6to1-sorted_context_2
+                    - --num_dataset_samples
+                    - "1000"
+                    - --num_input_frames
+                    - "6"
+                    - --resume_checkpoint
+                    - ./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context/epoch-79.safetensors
+                codePath: examples/wanvideo/model_training/train_SE.py
+                codePathLocal: model_training/train_SE.py
+                cpu_count: 48
+                cpu_count_logical: 96
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "205349208064"
+                        used: "75493683200"
+                email: szqwu57@gmail.com
+                executable: /home/qiwu2/anaconda3/envs/wan2/bin/python3.11
+                git:
+                    commit: 4c60a9f76dc3aa07b4171ef41812542de6c63598
+                    remote: git@github.com:szqwu/DiffSynth-Studio.git
+                gpu: NVIDIA RTX 6000 Ada Generation
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-caba2e61-cd68-11f2-0176-2c25d3702042
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-33f796eb-3e9c-65f7-f860-0d267e62d266
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-8f32fb82-d186-c2ec-7381-bb15439a2fa2
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-6ed6f2ea-e653-a517-f0cd-abb9958ac44c
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-4617f71a-98a5-5504-b148-568fc8663cde
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-dddc55d1-c852-2211-84a5-970809514b3e
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-24d69c8f-da38-586c-4939-7df7761e4264
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-f512c9db-80e8-5656-6e69-3cd6f111f88a
+                host: trinity-0-15
+                memory:
+                    total: "1082054094848"
+                os: Linux-4.18.0-372.32.1.el8_6.x86_64-x86_64-with-glibc2.28
+                program: /data2/qiwu2/DiffSynth-Studio/examples/wanvideo/model_training/train_SE.py
+                python: CPython 3.11.14
+                root: /data2/qiwu2/DiffSynth-Studio/examples/wanvideo
+                startedAt: "2026-03-09T07:25:26.885406Z"
+                writerId: 2zbkfrf8n44emduomhajllpwgtpw4md9
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 71
+                - 98
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+                - 98
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.11.14
+            "5": 0.24.2
+            "6": 5.1.0
+            "12": 0.24.2
+            "13": linux-x86_64
+audio_processor_path:
+    value: null
+data_file_keys:
+    value: image,video
+dataset_base_path:
+    value: ../../../DL3DV-10K_960P/1K
+dataset_metadata_path:
+    value: ../../../DL3DV-10K_960P/1K
+dataset_num_workers:
+    value: 0
+dataset_repeat:
+    value: 1
+extra_inputs:
+    value: input_image
+find_unused_parameters:
+    value: false
+fp8_models:
+    value: null
+fuse_vae_embedding_in_latents_multiple:
+    value: false
+gradient_accumulation_steps:
+    value: 1
+height:
+    value: 192
+initialize_model_on_cpu:
+    value: true
+learning_rate:
+    value: 0.0001
+lora_base_model:
+    value: dit
+lora_checkpoint:
+    value: null
+lora_rank:
+    value: 32
+lora_target_modules:
+    value: q,k,v,o,ffn.0,ffn.2
+max_pixels:
+    value: 1048576
+max_timestep_boundary:
+    value: 1
+min_input_frames:
+    value: 3
+min_output_frames:
+    value: 1
+min_timestep_boundary:
+    value: 0
+model_id_with_origin_paths:
+    value: Wan-AI/Wan2.1-I2V-14B-480P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-480P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-480P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-480P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+model_paths:
+    value: null
+modify_channels:
+    value: true
+new_in_dim:
+    value: 420
+no_pixel_unshuffle:
+    value: false
+num_dataset_samples:
+    value: 1000
+num_epochs:
+    value: 80
+num_frames:
+    value: 7
+num_input_frames:
+    value: 6
+num_output_frames:
+    value: null
+offload_models:
+    value: null
+output_path:
+    value: ./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context_2
+preset_lora_model:
+    value: null
+preset_lora_path:
+    value: null
+remove_prefix_in_ckpt:
+    value: pipe.dit.
+resume_checkpoint:
+    value: ./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context/epoch-79.safetensors
+reverse_pred_order:
+    value: false
+sampling_strategy:
+    value: prob_random
+save_steps:
+    value: null
+seperated_encoding:
+    value: true
+task:
+    value: sft
+tokenizer_path:
+    value: null
+trainable_models:
+    value: null
+use_camera_adapter:
+    value: false
+use_gradient_checkpointing:
+    value: false
+use_gradient_checkpointing_offload:
+    value: false
+use_prope:
+    value: false
+wandb_project:
+    value: wan-se-14b
+wandb_run_name:
+    value: lora32-6to1-sorted_context_2
+weight_decay:
+    value: 0.01
+width:
+    value: 336
+zero_temporal_rope:
+    value: false

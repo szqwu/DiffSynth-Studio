@@ -324,6 +324,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "height": data["input_images"][0].size[1],
             "width": data["input_images"][0].size[0],
             "num_frames": len(data["target_images"]),
+            "num_output_frames": len(data["target_images"]) - len(data["input_images"]),
             # For separate encoding: directly specify latent temporal dimension
             "num_latent_frames": len(data["target_images"]),
             # Please do not modify the following parameters
@@ -399,6 +400,18 @@ def wan_parser():
     parser.add_argument("--num_dataset_samples", type=int, default=1000, help="Number of dataset samples to use for training.")
     parser.add_argument("--no_pixel_unshuffle", default=False, action="store_true",
                         help="Do not use pixel unshuffle to downscale the raymap to 1/8 resolution.")
+    parser.add_argument("--num_input_frames", type=int, default=None,
+                        help="Number of input (context) frames M. "
+                             "If neither this nor --num_output_frames is set, M is randomly sampled "
+                             "each iteration (random M-to-N mode).")
+    parser.add_argument("--num_output_frames", type=int, default=None,
+                        help="Number of output (target) frames N. "
+                             "If neither this nor --num_input_frames is set, N is randomly sampled "
+                             "each iteration (random M-to-N mode). Default when M is fixed: 1.")
+    parser.add_argument("--min_input_frames", type=int, default=3,
+                        help="Minimum input frames in random M-to-N mode. Default: 3.")
+    parser.add_argument("--min_output_frames", type=int, default=1,
+                        help="Minimum output frames in random M-to-N mode. Default: 1.")
     return parser
 
 
@@ -424,6 +437,10 @@ if __name__ == "__main__":
         reverse_pred_order=args.reverse_pred_order,
         num_dataset_samples=args.num_dataset_samples,
         no_pixel_unshuffle=args.no_pixel_unshuffle,
+        num_input_frames=args.num_input_frames,
+        num_output_frames=args.num_output_frames,
+        min_input_frames=args.min_input_frames,
+        min_output_frames=args.min_output_frames,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,

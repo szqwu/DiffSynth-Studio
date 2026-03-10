@@ -289,14 +289,16 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
                   dreamsim_model=None, dreamsim_preprocess=None,
                   ssim_fn=None, lpips_model=None):
     """
-    Process a single DL3DV-10K scene: load data, run 6-to-1 NVS for each
-    target frame, compute metrics, save results.
+    Process a single DL3DV-10K scene: load data, run M-to-N NVS for each
+    batch of target frames, compute metrics, save results.
 
     Returns:
         dict with per-scene mean metrics, or None on failure.
     """
     model_h = args.height
     model_w = args.width
+    num_input = args.num_input_frames
+    num_output = args.num_output_frames
 
     # Paths
     scene_meta_path = os.path.join(args.dl3dv_meta_path, scene_hash)
@@ -307,7 +309,7 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     print(f"{'='*80}")
 
     # ── Load train/test split ──────────────────────────────────────────
-    split_file = os.path.join(scene_meta_path, "train_test_split_6.json")
+    split_file = os.path.join(scene_meta_path, f"train_test_split_{num_input}.json")
     if not os.path.exists(split_file):
         print(f"  Warning: {split_file} not found. Skipping.")
         return None
@@ -315,11 +317,12 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     with open(split_file, 'r') as f:
         split_data = json.load(f)
 
-    train_ids = split_data['train_ids']   # 6 context frames
+    train_ids = split_data['train_ids']   # M context frames
     test_ids = split_data['test_ids']     # target frames
 
-    print(f"  Context frame IDs: {train_ids}")
+    print(f"  Context frame IDs ({num_input}): {train_ids}")
     print(f"  Target frame IDs ({len(test_ids)} frames): {test_ids[:5]}{'...' if len(test_ids)>5 else ''}")
+    print(f"  Generation mode: {num_input}-to-{num_output}")
 
     # ── Load transforms.json ───────────────────────────────────────────
     transforms_file = os.path.join(scene_data_path, "transforms.json")
@@ -427,27 +430,33 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
 
     eval_size = args.eval_size
 
-    # ── Process each target frame (6-to-1 generation) ──────────────────
+    # ── Process target frames in batches of num_output ──────────────────
     psnrs = []
     ssims = []
     lpips_scores = []
     dreamsim_scores = []
 
-    for target_pos, target_frame_idx in enumerate(test_ids):
-        print(f"\n  [{target_pos+1}/{len(test_ids)}] Generating target frame_idx={target_frame_idx}...")
+    # Batch test_ids into groups of num_output
+    target_batches = [test_ids[i:i+num_output] for i in range(0, len(test_ids), num_output)]
+    total_batches = len(target_batches)
 
-        # 6 context + 1 target = 7 total
-        current_indices = train_ids + [target_frame_idx]
-        context_indices = list(range(len(train_ids)))           # [0,1,2,3,4,5]
-        target_indices = [len(train_ids)]                       # [6]
-        num_total = len(train_ids) + 1                          # 7
+    for batch_pos, target_batch in enumerate(target_batches):
+        batch_str = ",".join(str(t) for t in target_batch)
+        print(f"\n  [batch {batch_pos+1}/{total_batches}] Generating target frame_idx={batch_str}...")
+
+        # M context + N target (N may be < num_output for the last batch)
+        cur_num_output = len(target_batch)
+        current_indices = train_ids + target_batch
+        context_indices = list(range(num_input))
+        target_indices = list(range(num_input, num_input + cur_num_output))
+        num_total = num_input + cur_num_output
 
         # Prepare context images at model resolution (PIL)
         context_images = [Image.fromarray(all_images_model[idx]) for idx in train_ids]
 
         # Prepare extrinsics and intrinsics arrays
-        current_extrinsics = np.stack([all_extrinsics[idx] for idx in current_indices], axis=0)  # (7,4,4)
-        current_intrinsics = np.stack([scaled_intrinsic_model] * num_total, axis=0)               # (7,3,3)
+        current_extrinsics = np.stack([all_extrinsics[idx] for idx in current_indices], axis=0)
+        current_intrinsics = np.stack([scaled_intrinsic_model] * num_total, axis=0)
 
         # Compute plucker raymap and normalized camera params
         raymap, camera_poses_norm, intrinsics_tensor = prepare_raymap(
@@ -485,97 +494,90 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
 
         video = pipe(**pipe_kwargs)
 
-        # Extract generated target frame (last frame)
-        pred_pil = video[-1]
-        pred_frame = np.array(pred_pil)
+        # Extract generated target frames (last cur_num_output frames)
+        for out_i in range(cur_num_output):
+            target_frame_idx = target_batch[out_i]
+            pred_pil = video[num_input + out_i]
+            pred_frame = np.array(pred_pil)
 
-        # Save generated frame at model resolution
-        generated_frame_path = os.path.join(output_dir, f"generated_frame_{target_frame_idx:04d}_{model_h}x{model_w}.png")
-        pred_pil.save(generated_frame_path)
+            generated_frame_path = os.path.join(output_dir, f"generated_frame_{target_frame_idx:04d}_{model_h}x{model_w}.png")
+            pred_pil.save(generated_frame_path)
 
-        # Resize GT to generation (model) resolution, matching input_mode
-        gt_frame_960p = all_images_960p[target_frame_idx]
-        if input_mode == "crop":
-            gt_frame_model_res, _, _, _ = resize_crop_to_rect(gt_frame_960p, model_h, model_w)
-        else:
-            gt_frame_model_res = cv2.resize(gt_frame_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
+            gt_frame_960p = all_images_960p[target_frame_idx]
+            if input_mode == "crop":
+                gt_frame_model_res, _, _, _ = resize_crop_to_rect(gt_frame_960p, model_h, model_w)
+            else:
+                gt_frame_model_res = cv2.resize(gt_frame_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
 
-        # Resize and center crop both to eval_size for metrics
-        pred_frame_eval = resize_and_center_crop(pred_frame, eval_size)
-        gt_frame_eval = resize_and_center_crop(gt_frame_model_res, eval_size)
+            pred_frame_eval = resize_and_center_crop(pred_frame, eval_size)
+            gt_frame_eval = resize_and_center_crop(gt_frame_model_res, eval_size)
 
-        # PSNR
-        psnr = compute_psnr(pred_frame_eval, gt_frame_eval)
-        psnrs.append(psnr)
+            psnr = compute_psnr(pred_frame_eval, gt_frame_eval)
+            psnrs.append(psnr)
 
-        # SSIM
-        ssim_value = None
-        if ssim_fn is not None:
-            ssim_value = ssim_fn(gt_frame_eval, pred_frame_eval, multichannel=True, channel_axis=2, data_range=255)
-            ssims.append(ssim_value)
+            ssim_value = None
+            if ssim_fn is not None:
+                ssim_value = ssim_fn(gt_frame_eval, pred_frame_eval, multichannel=True, channel_axis=2, data_range=255)
+                ssims.append(ssim_value)
 
-        # LPIPS
-        lpips_value = None
-        if lpips_model is not None:
-            pred_lpips = torch.from_numpy(pred_frame_eval).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-            gt_lpips = torch.from_numpy(gt_frame_eval).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-            with torch.no_grad():
-                lpips_value = lpips_model(pred_lpips.cuda(), gt_lpips.cuda()).item()
-            lpips_scores.append(lpips_value)
+            lpips_value = None
+            if lpips_model is not None:
+                pred_lpips = torch.from_numpy(pred_frame_eval).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+                gt_lpips = torch.from_numpy(gt_frame_eval).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+                with torch.no_grad():
+                    lpips_value = lpips_model(pred_lpips.cuda(), gt_lpips.cuda()).item()
+                lpips_scores.append(lpips_value)
 
-        # DreamSim
-        ds_score = None
-        if dreamsim_model is not None:
-            pred_ds_pil = Image.fromarray(pred_frame_eval)
-            gt_ds_pil = Image.fromarray(gt_frame_eval)
-            pred_t = dreamsim_preprocess(pred_ds_pil).to("cuda")
-            gt_t = dreamsim_preprocess(gt_ds_pil).to("cuda")
-            if pred_t.dim() == 3:
-                pred_t = pred_t.unsqueeze(0)
-            if gt_t.dim() == 3:
-                gt_t = gt_t.unsqueeze(0)
-            while pred_t.dim() > 4:
-                pred_t = pred_t.squeeze(0)
-            while gt_t.dim() > 4:
-                gt_t = gt_t.squeeze(0)
-            with torch.no_grad():
-                ds_score = dreamsim_model(pred_t, gt_t).item()
-            dreamsim_scores.append(ds_score)
+            ds_score = None
+            if dreamsim_model is not None:
+                pred_ds_pil = Image.fromarray(pred_frame_eval)
+                gt_ds_pil = Image.fromarray(gt_frame_eval)
+                pred_t = dreamsim_preprocess(pred_ds_pil).to("cuda")
+                gt_t = dreamsim_preprocess(gt_ds_pil).to("cuda")
+                if pred_t.dim() == 3:
+                    pred_t = pred_t.unsqueeze(0)
+                if gt_t.dim() == 3:
+                    gt_t = gt_t.unsqueeze(0)
+                while pred_t.dim() > 4:
+                    pred_t = pred_t.squeeze(0)
+                while gt_t.dim() > 4:
+                    gt_t = gt_t.squeeze(0)
+                with torch.no_grad():
+                    ds_score = dreamsim_model(pred_t, gt_t).item()
+                dreamsim_scores.append(ds_score)
 
-        # Print metrics
-        msg = f"    PSNR={psnr:.2f} dB"
-        if ssim_value is not None:
-            msg += f", SSIM={ssim_value:.4f}"
-        if lpips_value is not None:
-            msg += f", LPIPS={lpips_value:.4f}"
-        if ds_score is not None:
-            msg += f", DreamSim={ds_score:.4f}"
-        print(msg)
+            msg = f"    Frame {target_frame_idx}: PSNR={psnr:.2f} dB"
+            if ssim_value is not None:
+                msg += f", SSIM={ssim_value:.4f}"
+            if lpips_value is not None:
+                msg += f", LPIPS={lpips_value:.4f}"
+            if ds_score is not None:
+                msg += f", DreamSim={ds_score:.4f}"
+            print(msg)
 
-        # Save comparison image
-        comparison = np.zeros((eval_size, eval_size * 2 + 20, 3), dtype=np.uint8)
-        comparison[:, :eval_size] = gt_frame_eval
-        comparison[:, eval_size+20:] = pred_frame_eval
-        comparison[:, eval_size:eval_size+20] = 255  # White separator
+            comparison = np.zeros((eval_size, eval_size * 2 + 20, 3), dtype=np.uint8)
+            comparison[:, :eval_size] = gt_frame_eval
+            comparison[:, eval_size+20:] = pred_frame_eval
+            comparison[:, eval_size:eval_size+20] = 255
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(comparison, "Ground Truth", (20, 40), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(comparison, "Ground Truth", (20, 40), font, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(comparison, "Prediction", (eval_size + 40, 40), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(comparison, "Prediction", (eval_size + 40, 40), font, 0.8, (0, 255, 255), 1, cv2.LINE_AA)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(comparison, "Ground Truth", (20, 40), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(comparison, "Ground Truth", (20, 40), font, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(comparison, "Prediction", (eval_size + 40, 40), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(comparison, "Prediction", (eval_size + 40, 40), font, 0.8, (0, 255, 255), 1, cv2.LINE_AA)
 
-        metrics_txt = f"Frame {target_frame_idx}: PSNR={psnr:.2f}"
-        if ssim_value is not None:
-            metrics_txt += f", SSIM={ssim_value:.3f}"
-        if lpips_value is not None:
-            metrics_txt += f", LPIPS={lpips_value:.3f}"
-        if ds_score is not None:
-            metrics_txt += f", DS={ds_score:.3f}"
-        cv2.putText(comparison, metrics_txt, (20, eval_size - 20), font, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(comparison, metrics_txt, (20, eval_size - 20), font, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+            metrics_txt = f"Frame {target_frame_idx}: PSNR={psnr:.2f}"
+            if ssim_value is not None:
+                metrics_txt += f", SSIM={ssim_value:.3f}"
+            if lpips_value is not None:
+                metrics_txt += f", LPIPS={lpips_value:.3f}"
+            if ds_score is not None:
+                metrics_txt += f", DS={ds_score:.3f}"
+            cv2.putText(comparison, metrics_txt, (20, eval_size - 20), font, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(comparison, metrics_txt, (20, eval_size - 20), font, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
 
-        comp_path = os.path.join(output_dir, f"comparison_frame_{target_frame_idx:04d}.png")
-        Image.fromarray(comparison).save(comp_path)
+            comp_path = os.path.join(output_dir, f"comparison_frame_{target_frame_idx:04d}.png")
+            Image.fromarray(comparison).save(comp_path)
 
     # ── Scene summary ──────────────────────────────────────────────────
     scene_metrics = {}
@@ -597,7 +599,7 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     metrics_file = os.path.join(output_dir, "metrics.txt")
     with open(metrics_file, 'w') as f:
         f.write(f"Scene: {scene_hash}\n")
-        f.write(f"Method: 6-to-1 generation (6 context frames + 1 target frame)\n")
+        f.write(f"Method: {num_input}-to-{num_output} generation ({num_input} context frames + {num_output} target frames)\n")
         f.write(f"Model resolution: {model_h}x{model_w}\n")
         f.write(f"Evaluation resolution: {eval_size}x{eval_size} (center crop)\n\n")
         f.write(f"Mean PSNR: {scene_metrics['psnr']:.2f} dB\n")
@@ -633,6 +635,7 @@ def main(args):
 
     print(f"Model resolution: {args.height}x{args.width}")
     print(f"Evaluation resolution: {args.eval_size}x{args.eval_size} (center crop)")
+    print(f"Generation mode: {args.num_input_frames}-to-{args.num_output_frames}")
     print(f"Number of scenes: {len(args.scenes)}")
 
     # ── Load pipeline ─────────────────────────────────────────────────────
@@ -737,13 +740,17 @@ def main(args):
 if __name__ == "__main__":
     start_time = time.time()
 
-    parser = argparse.ArgumentParser(description="Wan2.1 6-to-1 NVS evaluation on DL3DV-10K scenes")
+    parser = argparse.ArgumentParser(description="Wan2.1 M-to-N NVS evaluation on DL3DV-10K scenes")
 
     # Model
     parser.add_argument("--checkpoint_path", type=str, required=True,
                         help="Path to the trained checkpoint (.safetensors)")
     parser.add_argument("--new_in_dim", type=int, default=420,
                         help="New input dimension for the modified model (must match training --new_in_dim)")
+    parser.add_argument("--num_input_frames", type=int, default=6,
+                        help="Number of input (context) frames M. Default: 6.")
+    parser.add_argument("--num_output_frames", type=int, default=1,
+                        help="Number of output (target) frames N per inference call. Default: 1.")
 
     # Data paths
     parser.add_argument("--dl3dv_meta_path", type=str, default="/data2/qiwu2/dl3dv10",

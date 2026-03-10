@@ -1,12 +1,18 @@
 #!/bin/bash
 
-# Script to run Wan2.1 6-to-1 NVS evaluation on DL3DV-10K scenes
+# Script to run Wan2.1 M-to-N NVS evaluation on DL3DV-10K scenes
 # Processes scenes in parallel across 5 GPUs, 2 scenes per GPU
 
+# ── M-to-N configuration ──────────────────────────────────────────────────────
+NUM_INPUT_FRAMES="${1:-3}"
+NUM_OUTPUT_FRAMES="${2:-4}"
+
 # ── Configuration ──────────────────────────────────────────────────────────────
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-69-new.safetensors"
-output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-69-new"
-GPU_IDS=( 0 1 2 3 4)
+# checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-69-new.safetensors"
+# output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-69-new"
+checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
+output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope-480p_epoch-59"
+GPU_IDS=( 2 3 4 5 6)
 # GPU_IDS=(  7 )
 SCENES_PER_GPU=2
 
@@ -25,11 +31,12 @@ SCENES=(
 )
 
 echo "========================================"
-echo "Wan2.1 6-to-1 NVS - DL3DV-10K Evaluation (Parallel)"
+echo "Wan2.1 ${NUM_INPUT_FRAMES}-to-${NUM_OUTPUT_FRAMES} NVS - DL3DV-10K Evaluation (Parallel)"
 echo "========================================"
 echo "Checkpoint: $checkpoint_path"
 echo "Output path: $output_path"
 echo "GPUs: ${GPU_IDS[*]}"
+echo "Generation: ${NUM_INPUT_FRAMES}-to-${NUM_OUTPUT_FRAMES}"
 echo "Number of scenes: ${#SCENES[@]}"
 echo "Scenes per GPU: $SCENES_PER_GPU"
 echo ""
@@ -53,6 +60,8 @@ for i in "${!GPU_IDS[@]}"; do
         --checkpoint_path $checkpoint_path \
         --output_path $output_path \
         --scenes ${gpu_scenes[@]} \
+        --num_input_frames $NUM_INPUT_FRAMES \
+        --num_output_frames $NUM_OUTPUT_FRAMES \
         --use_dreamsim \
         --use_ssim \
         --use_lpips \
@@ -60,6 +69,7 @@ for i in "${!GPU_IDS[@]}"; do
         --height 480 \
         --width 832 \
         --eval_size 480 \
+        --zero_temporal_rope \
         > >(while read line; do echo "[GPU $gpu_id] $line"; done) \
         2>&1 &
 

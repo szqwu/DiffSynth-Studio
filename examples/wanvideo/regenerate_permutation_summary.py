@@ -122,8 +122,9 @@ if __name__ == "__main__":
         dirs = sys.argv[1:]
     else:
         dirs = [
+            "/data2/qiwu2/dl3dv_test_results_wan21_6to1_sorted_context_79_permtest_permnoise",
             "/data2/qiwu2/dl3dv_test_results_wan21_6to1_random_79_permtest_permnoise",
-            "/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_79_permtest_permnoise",
+            "/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_79_2_permtest_permnoise",
         ]
 
     for d in dirs:

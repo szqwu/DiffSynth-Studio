@@ -33,7 +33,7 @@ import torch
 # ──────────────────────────────────────────────────────────────────────────────
 
 COLMAP_CAMERA_MODEL_NUM_PARAMS = {
-    0: 3, 1: 4, 2: 5, 3: 8, 4: 8, 5: 12, 6: 4, 7: 5, 8: 4,
+    0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12,
 }
 
 
@@ -188,7 +188,8 @@ def save_comparison_image(gt_crop, pred_crop, frame_idx, image_name,
 def process_scene(scene_name, results_dir, mip360_data_path, mip360_split_path,
                   ssim_fn, lpips_model, dreamsim_model, dreamsim_preprocess,
                   model_h, model_w, eval_h, eval_w,
-                  save_comparisons=False, no_center_crop=False):
+                  save_comparisons=False, no_center_crop=False,
+                  save_gt_crops=False):
     scene_dir = os.path.join(results_dir, scene_name)
     if not os.path.isdir(scene_dir):
         print(f"  [SKIP] Scene directory not found: {scene_dir}")
@@ -206,11 +207,17 @@ def process_scene(scene_name, results_dir, mip360_data_path, mip360_split_path,
     scene_data_path = os.path.join(mip360_data_path, scene_name)
     image_names = get_sorted_image_names(scene_data_path)
 
+    tag = f"full_{model_h}x{model_w}" if no_center_crop else f"{eval_h}x{eval_w}"
+
     comp_dir = None
     if save_comparisons:
-        tag = f"full_{model_h}x{model_w}" if no_center_crop else f"{eval_h}x{eval_w}"
         comp_dir = os.path.join(scene_dir, f"comparisons_{tag}")
         os.makedirs(comp_dir, exist_ok=True)
+
+    gt_crop_dir = None
+    if save_gt_crops:
+        gt_crop_dir = os.path.join(scene_dir, f"gt_crops_{tag}")
+        os.makedirs(gt_crop_dir, exist_ok=True)
 
     psnrs, ssims, lpipss, dreamsims = [], [], [], []
     per_frame = []
@@ -267,6 +274,10 @@ def process_scene(scene_name, results_dir, mip360_data_path, mip360_split_path,
                 os.path.join(comp_dir, f"comparison_{frame_idx:04d}.png"),
             )
 
+        if gt_crop_dir is not None:
+            gt_save_path = os.path.join(gt_crop_dir, f"gt_{frame_idx:04d}_{img_name}")
+            Image.fromarray(gt_crop).save(gt_save_path)
+
     if not psnrs:
         print(f"  [SKIP] No valid frames for scene {scene_name}")
         return None
@@ -314,6 +325,8 @@ def main():
                         help="Evaluate at full model resolution without center crop")
     parser.add_argument("--save_comparisons", action="store_true",
                         help="Save side-by-side GT vs Pred comparison images")
+    parser.add_argument("--save_gt_crops", action="store_true",
+                        help="Save cropped GT images to gt_crops_<tag>/ per scene")
     args = parser.parse_args()
 
     model_h = args.model_h
@@ -363,6 +376,7 @@ def main():
             model_h, model_w, eval_h, eval_w,
             save_comparisons=args.save_comparisons,
             no_center_crop=no_center_crop,
+            save_gt_crops=args.save_gt_crops,
         )
         if result is not None:
             all_results.append(result)

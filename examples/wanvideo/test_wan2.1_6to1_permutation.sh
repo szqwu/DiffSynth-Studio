@@ -7,7 +7,7 @@
 # ── Mode: "standard", "prope", or "zero_temporal_rope" ────────────────────────
 MODE="${1:-standard}"
 # ── Optional: also permute noise (2nd argument, "yes" to enable) ──────────────
-PERMUTE_NOISE="${2:-no}"
+PERMUTE_NOISE="${2:-yes}"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 NOISE_SUFFIX=""
@@ -26,11 +26,11 @@ elif [ "$MODE" = "zero_temporal_rope" ]; then
     output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_79_2_permtest${NOISE_SUFFIX}"
     EXTRA_ARGS="--zero_temporal_rope"
 else
-    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_random/epoch-79.safetensors"
-    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_random_79_permtest${NOISE_SUFFIX}"
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context/epoch-79.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_sorted_context_79_permtest${NOISE_SUFFIX}"
     EXTRA_ARGS=""
 fi
-GPU_ID=4
+GPU_ID=7
 
 # All 10 DL3DV-10K test scenes
 SCENES=(

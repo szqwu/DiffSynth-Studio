@@ -547,54 +547,51 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
 class WanVideoUnit_ImageEmbedderVAE_SeparatedEncoding(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
+            input_params=("input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride", "num_latent_frames"),
             output_params=("y",),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_image, end_image, num_frames, height, width, tiled, tile_size, tile_stride):
+    def process(self, pipe: WanVideoPipeline, input_image, end_image, num_frames, height, width, tiled, tile_size, tile_stride, num_latent_frames=None):
         if input_image is None or not pipe.dit.require_vae_embedding or not pipe.dit.seperated_encoding:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         image = []
-        # print(f"len(input_image): {len(input_image)}")
         for i in range(len(input_image)):
             image.append(pipe.preprocess_image(input_image[i].resize((width, height))).to(pipe.device))
         image = torch.concat(image, dim=0)
-        # print(f"image.shape: {image.shape}")
-        # print(f"height: {height}")
-        # print(f"width: {width}")
+        
+        num_input = len(input_image)
+        # Use num_latent_frames (unmodified by ShapeChecker) to match noise temporal dim;
+        # fall back to num_input + 1 (original N=1 behavior) if not provided.
+        num_total = num_latent_frames if num_latent_frames is not None else (num_input + 1)
+        num_output = num_total - num_input
         
         reverse_pred = getattr(pipe.dit, 'reverse_pred_order', False)
         
-        msk = torch.ones(1, len(input_image)+1, height//8, width//8, device=pipe.device)
+        msk = torch.ones(1, num_total, height//8, width//8, device=pipe.device)
         if reverse_pred:
-            # Reversed: first frame is prediction target (mask=0), rest are context (mask=1)
-            msk[:, :1] = 0
+            msk[:, :num_output] = 0
         else:
-            # Original: last frame is prediction target (mask=0), context frames first (mask=1)
-            msk[:, len(input_image):] = 0
+            msk[:, num_input:] = 0
         
         if end_image is not None:
             end_image = pipe.preprocess_image(end_image.resize((width, height))).to(pipe.device)
             vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
             msk[:, -1:] = 1
         else:
+            target_zeros = torch.zeros(3, num_output, height, width).to(image.device)
             if reverse_pred:
-                # Reversed: zeros for target (first), then context images
-                vae_input = torch.concat([torch.zeros(3, 1, height, width).to(image.device), image.transpose(0, 1)], dim=1)
+                vae_input = torch.concat([target_zeros, image.transpose(0, 1)], dim=1)
             else:
-                # Original: context images first, then zeros for target (last)
-                vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, 1, height, width).to(image.device)], dim=1)
+                vae_input = torch.concat([image.transpose(0, 1), target_zeros], dim=1)
 
-        # Repeat each frame's mask 4 times temporally, then group into 4 channels
-        # to match the standard VAE embedding mask format [4, num_frames, h//8, w//8]
-        msk = torch.repeat_interleave(msk, repeats=4, dim=1)  # [1, num_frames*4, h//8, w//8]
-        msk = msk.view(1, len(input_image)+1, 4, height//8, width//8)
-        msk = msk.transpose(1, 2)[0]  # [4, num_frames, h//8, w//8]
+        msk = torch.repeat_interleave(msk, repeats=4, dim=1)
+        msk = msk.view(1, num_total, 4, height//8, width//8)
+        msk = msk.transpose(1, 2)[0]  # [4, num_total, h//8, w//8]
         
         ys = []
-        for i in range(len(input_image)+1):
+        for i in range(num_total):
             ys.append(pipe.vae.encode([vae_input[:, i:i+1].to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0])
         y = torch.concat(ys, dim=1)
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)

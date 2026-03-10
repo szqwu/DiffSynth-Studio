@@ -372,6 +372,10 @@ class my_cognvs_dataset(Dataset):
             reverse_pred_order=False,
             num_dataset_samples=1000,
             no_pixel_unshuffle=False,
+            num_input_frames=None,
+            num_output_frames=None,
+            min_input_frames=3,
+            min_output_frames=1,
         ):
 
         self.base_path = base_path
@@ -380,6 +384,26 @@ class my_cognvs_dataset(Dataset):
         self.num_frames = num_frames
         self.height = height
         self.width = width
+        # M-to-N frame split configuration:
+        #   Both None  → random split each sample (M ∈ [min_input, num_frames-min_output])
+        #   Fixed      → deterministic split
+        self.random_split = (num_input_frames is None and num_output_frames is None)
+        if self.random_split:
+            self.num_input_frames = None
+            self.num_output_frames = None
+            self.min_input_frames = min_input_frames
+            self.min_output_frames = min_output_frames
+            assert min_input_frames + min_output_frames <= num_frames, \
+                f"min_input ({min_input_frames}) + min_output ({min_output_frames}) > num_frames ({num_frames})"
+        elif num_input_frames is not None:
+            self.num_input_frames = num_input_frames
+            self.num_output_frames = num_output_frames if num_output_frames is not None else 1
+            assert self.num_input_frames + self.num_output_frames == self.num_frames, \
+                f"num_input_frames ({self.num_input_frames}) + num_output_frames ({self.num_output_frames}) != num_frames ({self.num_frames})"
+        else:
+            num_output_frames = num_output_frames if num_output_frames is not None else 1
+            self.num_input_frames = num_frames - num_output_frames
+            self.num_output_frames = num_output_frames
         self.height_division_factor = height_division_factor
         self.width_division_factor = width_division_factor
         self.time_division_factor = time_division_factor
@@ -622,12 +646,21 @@ class my_cognvs_dataset(Dataset):
         # target_images = [target_images[i] for i in sampled_indices]
         # print(f"input_images: {len(input_images)}, target_images: {len(target_images)}")
 
-        # Separate encoding
+        # Separate encoding: pick M input + N output frames
+        if self.random_split:
+            max_input = self.num_frames - self.min_output_frames
+            cur_num_input = random.randint(self.min_input_frames, max_input)
+            cur_num_output = self.num_frames - cur_num_input
+        else:
+            cur_num_input = self.num_input_frames
+            cur_num_output = self.num_output_frames
+
         input_target_indices = np.random.choice(seperate_encoding_num_samples, self.num_frames, replace=False)
         sampled_indices = [sampled_indices[i] for i in input_target_indices]
-        context_indices = sampled_indices[:self.num_frames-1]
-        target_idx = sampled_indices[self.num_frames-1:]
-        # print(f"sampled_indices: {sampled_indices}")
+        # context_indices = sorted(sampled_indices[:cur_num_input])
+        context_indices = sampled_indices[:cur_num_input]
+        target_idx = sampled_indices[cur_num_input:]
+        # sampled_indices = context_indices + target_idx
         # print(f"context_indices: {context_indices}, target_idx: {target_idx}")
 
         context_frames = [input_images[i] for i in context_indices]
@@ -651,14 +684,10 @@ class my_cognvs_dataset(Dataset):
             w2cs = torch.linalg.inv(camera_poses)
             w2cs[:, [1, 2], :] *= -1  # OpenGL -> OpenCV
 
-            # context_poses = w2cs[context_indices]
-            # target_pose = w2cs[target_idx]
-            # context_intrinsics = intrinsics[context_indices]
-            # target_intrinsics = intrinsics[target_idx]
-            context_poses = w2cs[:self.num_frames-1]
-            target_pose = w2cs[self.num_frames-1:]
-            context_intrinsics = intrinsics[:self.num_frames-1]
-            target_intrinsics = intrinsics[self.num_frames-1:]
+            context_poses = w2cs[:cur_num_input]
+            target_pose = w2cs[cur_num_input:]
+            context_intrinsics = intrinsics[:cur_num_input]
+            target_intrinsics = intrinsics[cur_num_input:]
             if self.reverse_pred_order:
                 # Target first, then context
                 w2cs = torch.cat([target_pose, context_poses], dim=0)
