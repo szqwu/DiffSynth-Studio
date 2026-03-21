@@ -428,27 +428,11 @@ class my_cognvs_dataset(Dataset):
         # get full path of videos
         # self.video_list_dl3dv = [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith('.mp4')]
         self.video_list_dl3dv = [os.path.join(base_path, f, "images_4") for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
-        self.video_list_dl3dv_2k_path = '/data2/qiwu2/2K'
-        self.video_list_dl3dv_2k = [os.path.join(self.video_list_dl3dv_2k_path, f, "images_4") for f in os.listdir(self.video_list_dl3dv_2k_path) if os.path.isdir(os.path.join(self.video_list_dl3dv_2k_path, f))]
-        self.video_list_dl3dv = self.video_list_dl3dv + self.video_list_dl3dv_2k
-
-        # # Filter out scenes whose transforms.json has too few frames for windowed sampling
-        # MIN_CAMERA_FRAMES = 48
-        # filtered = []
-        # for v in self.video_list_dl3dv:
-        #     tf_path = v.replace("images_4", "transforms.json")
-        #     if os.path.exists(tf_path):
-        #         try:
-        #             with open(tf_path, 'r') as f:
-        #                 nf = len(json.load(f).get('frames', []))
-        #             if nf < MIN_CAMERA_FRAMES:
-        #                 print(f"Skipping {v}: transforms.json has only {nf} frames")
-        #                 continue
-        #         except Exception:
-        #             pass
-        #     filtered.append(v)
-        # self.video_list_dl3dv = filtered
-
+        self.video_list_dl3dv_2k_path = '/ocean/projects/cis250177p/qwu6/DL3DV-10K_960P/2K'
+        if os.path.isdir(self.video_list_dl3dv_2k_path):
+            self.video_list_dl3dv_2k = [os.path.join(self.video_list_dl3dv_2k_path, f, "images_4") for f in os.listdir(self.video_list_dl3dv_2k_path) if os.path.isdir(os.path.join(self.video_list_dl3dv_2k_path, f))]
+            self.video_list_dl3dv = self.video_list_dl3dv + self.video_list_dl3dv_2k
+            print(f"Added {len(self.video_list_dl3dv_2k)} scenes from 2K split")
         self.video_list = self.video_list_dl3dv[:num_dataset_samples]
         self.video_list.sort()
         print(f"Total number of videos: {len(self.video_list)}")
@@ -625,7 +609,6 @@ class my_cognvs_dataset(Dataset):
                 seperate_encoding_num_samples = num_frames
         else:
             seperate_encoding_num_samples = num_frames
-        # Clamp to valid range: must not exceed available frames and must be >= self.num_frames
         seperate_encoding_num_samples = max(self.num_frames, min(seperate_encoding_num_samples, num_frames))
         start_idx = random.randint(0, num_frames - seperate_encoding_num_samples)
         sampled_indices = list(range(start_idx, start_idx + seperate_encoding_num_samples))

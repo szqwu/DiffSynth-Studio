@@ -1,6 +1,7 @@
 import torch, os, argparse, accelerate, warnings
 # from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.my_v2v_dataset_images_in_plucker_SE import my_cognvs_dataset
+from diffsynth.core.data.eschernet_combined_dataset import EscherNetCombinedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -412,6 +413,17 @@ def wan_parser():
                         help="Minimum input frames in random M-to-N mode. Default: 3.")
     parser.add_argument("--min_output_frames", type=int, default=1,
                         help="Minimum output frames in random M-to-N mode. Default: 1.")
+    parser.add_argument("--dataset_type", type=str, default="dl3dv",
+                        choices=["dl3dv", "eschernet_combined"],
+                        help="Which dataset to use. 'dl3dv' uses the DL3DV dataset via "
+                             "my_cognvs_dataset. 'eschernet_combined' uses BlendedMVS + "
+                             "RealEstate10K + SpatialVid via EscherNetCombinedDataset.")
+    parser.add_argument("--combined_dataset_names", type=str, nargs="+",
+                        default=["blendedmvs", "realestate10k", "spatialvid"],
+                        help="Dataset names for eschernet_combined mode.")
+    parser.add_argument("--combined_dataset_ratios", type=float, nargs="+",
+                        default=[4, 3, 3],
+                        help="Sampling ratios for eschernet_combined mode.")
     return parser
 
 
@@ -422,26 +434,46 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = my_cognvs_dataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        num_frames=args.num_frames,
-        height=args.height,
-        width=args.width,
-        height_division_factor=8,
-        width_division_factor=8,
-        time_division_factor=4,
-        time_division_remainder=1,
-        sampling_strategy=args.sampling_strategy,
-        reverse_pred_order=args.reverse_pred_order,
-        num_dataset_samples=args.num_dataset_samples,
-        no_pixel_unshuffle=args.no_pixel_unshuffle,
-        num_input_frames=args.num_input_frames,
-        num_output_frames=args.num_output_frames,
-        min_input_frames=args.min_input_frames,
-        min_output_frames=args.min_output_frames,
-    )
+    if args.dataset_type == "eschernet_combined":
+        dataset = EscherNetCombinedDataset(
+            dataset_names=args.combined_dataset_names,
+            dataset_ratios=args.combined_dataset_ratios,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            repeat=args.dataset_repeat,
+            sampling_strategy=args.sampling_strategy,
+            reverse_pred_order=args.reverse_pred_order,
+            no_pixel_unshuffle=args.no_pixel_unshuffle,
+            num_input_frames=args.num_input_frames,
+            num_output_frames=args.num_output_frames,
+            min_input_frames=args.min_input_frames,
+            min_output_frames=args.min_output_frames,
+        )
+    else:
+        assert args.dataset_base_path, (
+            "--dataset_base_path is required when --dataset_type is 'dl3dv'"
+        )
+        dataset = my_cognvs_dataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            num_frames=args.num_frames,
+            height=args.height,
+            width=args.width,
+            height_division_factor=8,
+            width_division_factor=8,
+            time_division_factor=4,
+            time_division_remainder=1,
+            sampling_strategy=args.sampling_strategy,
+            reverse_pred_order=args.reverse_pred_order,
+            num_dataset_samples=args.num_dataset_samples,
+            no_pixel_unshuffle=args.no_pixel_unshuffle,
+            num_input_frames=args.num_input_frames,
+            num_output_frames=args.num_output_frames,
+            min_input_frames=args.min_input_frames,
+            min_output_frames=args.min_output_frames,
+        )
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
