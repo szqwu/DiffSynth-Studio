@@ -32,7 +32,7 @@ from .my_v2v_dataset_images_in_plucker_SE import (
 logger = get_logger("trainer", "INFO")
 
 # ── Dataset paths (matching EscherNet module-level constants) ──────────────────
-BLENDEDMVS_DIR = "/ocean/projects/cis240058p/qitaoz/BlendedMVS_processed"
+BLENDEDMVS_DIR = "/ocean/projects/cis250177p/qwu6/BlendedMVS_processed"
 BLENDEDMVS_SPLITS_DIR = (
     "/ocean/projects/cis240037p/qitaoz/ray_diffusion/diffusion/dataset/blendedmvs_splits"
 )
@@ -91,7 +91,12 @@ class EscherNetCombinedDataset(Dataset):
         min_output_frames: int = 1,
         height_division_factor: int = 8,
         width_division_factor: int = 8,
+        resize_mode: str = "crop",
     ):
+        assert resize_mode in ("crop", "stretch"), (
+            f"resize_mode must be 'crop' or 'stretch', got '{resize_mode}'"
+        )
+        self.resize_mode = resize_mode
         self.height = height
         self.width = width
         self.num_frames = num_frames
@@ -181,8 +186,15 @@ class EscherNetCombinedDataset(Dataset):
     # ── metadata loaders ───────────────────────────────────────────────────
     def _load_blendedmvs(self) -> list:
         train_list = osp.join(BLENDEDMVS_SPLITS_DIR, "BlendedMVG_training.txt")
-        with open(train_list, "r") as f:
-            sequence_names = [ln.strip() for ln in f if ln.strip()]
+        if osp.exists(train_list):
+            with open(train_list, "r") as f:
+                sequence_names = [ln.strip() for ln in f if ln.strip()]
+        else:
+            sequence_names = sorted(
+                osp.splitext(f)[0]
+                for f in os.listdir(osp.join(BLENDEDMVS_DIR, "annotations"))
+                if f.endswith(".json")
+            )
 
         sequences = []
         for seq_name in tqdm(sequence_names, desc="BlendedMVS"):
@@ -231,7 +243,7 @@ class EscherNetCombinedDataset(Dataset):
                 seq_names.append(seq.rstrip("/").split("/")[-1])
 
         sequences = []
-        for seq_name in tqdm(seq_names[:0], desc="RealEstate10K"):
+        for seq_name in tqdm(seq_names, desc="RealEstate10K"):
             meta_path = osp.join(dataset_path, "metadata", seq_name + ".json")
             if not osp.exists(meta_path):
                 continue
@@ -261,7 +273,7 @@ class EscherNetCombinedDataset(Dataset):
             seq_names = [ln.strip() for ln in f if ln.strip()]
 
         sequences = []
-        for seq_name in tqdm(seq_names[:1000], desc="SpatialVid"):
+        for seq_name in tqdm(seq_names, desc="SpatialVid"):
             anno = osp.join(SPATIALVID_PATH, seq_name, f"{seq_name}.json")
             if not osp.exists(anno):
                 continue
@@ -290,7 +302,7 @@ class EscherNetCombinedDataset(Dataset):
 
     # ── helpers ─────────────────────────────────────────────────────────────
     @staticmethod
-    def _scale_intrinsics(
+    def _scale_intrinsics_crop(
         fx, fy, cx, cy, orig_w, orig_h, tgt_w, tgt_h,
     ) -> np.ndarray:
         """Adjust intrinsics for uniform-scale-then-center-crop (ImageCropAndResize)."""
@@ -302,6 +314,19 @@ class EscherNetCombinedDataset(Dataset):
         return np.array([
             [fx * scale, 0, cx * scale - crop_x],
             [0, fy * scale, cy * scale - crop_y],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+    @staticmethod
+    def _scale_intrinsics_stretch(
+        fx, fy, cx, cy, orig_w, orig_h, tgt_w, tgt_h,
+    ) -> np.ndarray:
+        """Adjust intrinsics for independent x/y stretch resize (no crop)."""
+        sx = tgt_w / orig_w
+        sy = tgt_h / orig_h
+        return np.array([
+            [fx * sx, 0, cx * sx],
+            [0, fy * sy, cy * sy],
             [0, 0, 1],
         ], dtype=np.float64)
 
@@ -363,13 +388,21 @@ class EscherNetCombinedDataset(Dataset):
             ordered_indices = context_indices + target_indices
 
         # Image resizer
-        process = ImageCropAndResize(
-            height=self.height,
-            width=self.width,
-            max_pixels=1920 * 1080,
-            height_division_factor=self.height_division_factor,
-            width_division_factor=self.width_division_factor,
-        )
+        if self.resize_mode == "stretch":
+            _resize = lambda img: img.resize(
+                (self.width, self.height), Image.BILINEAR
+            )
+            _scale_K = self._scale_intrinsics_stretch
+        else:
+            _crop_and_resize = ImageCropAndResize(
+                height=self.height,
+                width=self.width,
+                max_pixels=1920 * 1080,
+                height_division_factor=self.height_division_factor,
+                width_division_factor=self.width_division_factor,
+            )
+            _resize = _crop_and_resize
+            _scale_K = self._scale_intrinsics_crop
 
         try:
             all_images: list[Image.Image] = []
@@ -382,11 +415,11 @@ class EscherNetCombinedDataset(Dataset):
                 # Load and resize image (returns PIL)
                 img = Image.open(frame["image_path"]).convert("RGB")
                 orig_w, orig_h = img.width, img.height
-                img = process(img)
+                img = _resize(img)
                 all_images.append(img)
 
                 # Intrinsics scaled for the target resolution
-                K = self._scale_intrinsics(
+                K = _scale_K(
                     frame["fx"], frame["fy"], frame["cx"], frame["cy"],
                     orig_w, orig_h, self.width, self.height,
                 )

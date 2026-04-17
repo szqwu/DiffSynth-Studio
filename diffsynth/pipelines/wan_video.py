@@ -71,6 +71,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_FunCameraControl(),
             WanVideoUnit_FunCameraControlSE(),
             WanVideoUnit_ProPE(),
+            WanVideoUnit_RayRoPE(),
             WanVideoUnit_SpeedControl(),
             WanVideoUnit_VACE(),
             WanVideoUnit_AnimateVideoSplit(),
@@ -259,6 +260,7 @@ class WanVideoPipeline(BasePipeline):
         intrinsics: Optional[torch.Tensor] = None,
         use_prope: bool = False,
         zero_temporal_rope: bool = False,
+        use_rayrope: bool = False,
         num_latent_frames: Optional[int] = None,
     ):
         # Scheduler
@@ -298,6 +300,7 @@ class WanVideoPipeline(BasePipeline):
             "intrinsics": intrinsics,
             "use_prope": use_prope,
             "zero_temporal_rope": zero_temporal_rope,
+            "use_rayrope": use_rayrope,
             "num_latent_frames": num_latent_frames,
         }
         for unit in self.units:
@@ -936,6 +939,30 @@ class WanVideoUnit_ProPE(PipelineUnit):
         return {"viewmats": viewmats, "Ks": Ks, "image_hw": image_hw}
 
 
+class WanVideoUnit_RayRoPE(PipelineUnit):
+    """
+    Prepare camera parameters for HybridRayRoPE.
+    Converts c2w poses to w2c viewmats and packages intrinsics.
+    Same conversion as WanVideoUnit_ProPE but gated by use_rayrope flag.
+    """
+    def __init__(self):
+        super().__init__(
+            input_params=("use_rayrope", "camera_poses_norm", "intrinsics", "height", "width"),
+            output_params=("viewmats", "Ks", "image_hw", "use_rayrope"),
+        )
+
+    def process(self, pipe: WanVideoPipeline, use_rayrope, camera_poses_norm, intrinsics, height, width):
+        if not use_rayrope or camera_poses_norm is None or intrinsics is None:
+            return {}
+
+        viewmats = torch.linalg.inv(camera_poses_norm.float()).to(camera_poses_norm.dtype)
+        viewmats = viewmats.unsqueeze(0)  # [1, T, 4, 4]
+        Ks = intrinsics.unsqueeze(0)  # [1, T, 3, 3]
+        image_hw = (height, width)
+
+        return {"viewmats": viewmats, "Ks": Ks, "image_hw": image_hw, "use_rayrope": True}
+
+
 class WanVideoUnit_SpeedControl(PipelineUnit):
     def __init__(self):
         super().__init__(
@@ -1496,6 +1523,7 @@ def model_fn_wan_video(
     Ks: Optional[torch.Tensor] = None,
     image_hw: Optional[tuple] = None,
     zero_temporal_rope: bool = False,
+    use_rayrope: bool = False,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1639,18 +1667,45 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
-    f_freqs = dit.freqs[0][:f]
-    if zero_temporal_rope:
-        f_freqs = torch.ones_like(f_freqs)
-    freqs = torch.cat([
-        f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    # Build RayRoPE data if enabled
+    rayrope_data = None
+    if use_rayrope and getattr(dit, 'use_rayrope', False) and viewmats is not None and Ks is not None and image_hw is not None:
+        from diffsynth.models.rayrope import HybridRayRoPE
+        rayrope_module = HybridRayRoPE(
+            w2cs=viewmats.to(dtype=torch.float32, device=x.device),
+            Ks=Ks.to(dtype=torch.float32, device=x.device),
+            patches_x=w, patches_y=h,
+            image_width=image_hw[1], image_height=image_hw[0],
+            num_rayrope_freqs=3,
+        )
+        f_freqs = dit.freqs[0][:f]
+        if zero_temporal_rope:
+            f_freqs = torch.ones_like(f_freqs)
+        grid_t = f_freqs[:, :16].view(f, 1, 1, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+        grid_h = dit.freqs[1][:h, :15].view(1, h, 1, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+        grid_w = dit.freqs[2][:w, :15].view(1, 1, w, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+        rayrope_data = {
+            "rayrope_module": rayrope_module,
+            "grid_t": grid_t,
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+        }
+        head_dim = dit.dim // dit.num_heads
+        freqs = torch.ones(f * h * w, 1, head_dim // 2, device=x.device, dtype=torch.complex64)
+    else:
+        f_freqs = dit.freqs[0][:f]
+        if zero_temporal_rope:
+            f_freqs = torch.ones_like(f_freqs)
+        freqs = torch.cat([
+            f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
+            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # PRoPE: camera-geometry-aware positional encoding (replaces 3D RoPE when enabled)
+    # Mutually exclusive with rayrope
     prope_attn = None
-    if viewmats is not None and Ks is not None and image_hw is not None:
+    if rayrope_data is None and viewmats is not None and Ks is not None and image_hw is not None:
         from diffsynth.models.prope import PropeDotProductAttention
         head_dim = dit.dim // dit.num_heads
         prope_attn = PropeDotProductAttention(
@@ -1705,9 +1760,9 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
-        def create_custom_forward(module, _prope_attn=None):
+        def create_custom_forward(module, _prope_attn=None, _rayrope_data=None):
             def custom_forward(*inputs):
-                return module(*inputs, prope_attn=_prope_attn)
+                return module(*inputs, prope_attn=_prope_attn, rayrope_data=_rayrope_data)
             return custom_forward
         
         def create_custom_forward_vap(block, vap):
@@ -1737,18 +1792,18 @@ def model_fn_wan_video(
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block, prope_attn),
+                            create_custom_forward(block, prope_attn, rayrope_data),
                             x, context, t_mod, freqs,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block, prope_attn),
+                        create_custom_forward(block, prope_attn, rayrope_data),
                         x, context, t_mod, freqs,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs, prope_attn=prope_attn)
+                    x = block(x, context, t_mod, freqs, prope_attn=prope_attn, rayrope_data=rayrope_data)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

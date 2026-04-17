@@ -101,7 +101,8 @@ def compute_threshold_ratios(scores, num_thresholds=1000):
 
 
 def plot_threshold_analysis(json_files, mode='images', output_file='dreamsim_results/threshold_plot.png', 
-                            num_thresholds=1000, base_dir='dreamsim_results'):
+                            num_thresholds=1000, base_dir='dreamsim_results', labels=None,
+                            linestyles=None):
     """
     Plot threshold analysis for multiple JSON files.
     
@@ -111,10 +112,12 @@ def plot_threshold_analysis(json_files, mode='images', output_file='dreamsim_res
         output_file: Output path for the plot
         num_thresholds: Number of threshold points to evaluate
         base_dir: Base directory for JSON files (if relative paths provided)
+        labels: Optional list of short display names (one per json_file)
+        linestyles: Optional list of line styles (e.g. 'solid', 'dashed') per json_file
     """
     # Load all JSON files
     all_data = {}
-    for json_file in json_files:
+    for idx, json_file in enumerate(json_files):
         # Construct full path
         if os.path.isabs(json_file):
             full_path = json_file
@@ -124,8 +127,12 @@ def plot_threshold_analysis(json_files, mode='images', output_file='dreamsim_res
         print(f"Loading {full_path}...")
         data = load_dreamsim_json(full_path)
         if data is not None:
-            # Extract name from filename (without extension)
-            name = os.path.splitext(os.path.basename(json_file))[0]
+            if labels and idx < len(labels):
+                name = labels[idx]
+            else:
+                basename = os.path.splitext(os.path.basename(json_file))[0]
+                parent = os.path.basename(os.path.dirname(full_path))
+                name = f"{parent}/{basename}" if basename in all_data else basename
             all_data[name] = data
             print(f"  Loaded {name}: {len(data)} folders")
         else:
@@ -187,10 +194,15 @@ def plot_threshold_analysis(json_files, mode='images', output_file='dreamsim_res
     print(f"\nGenerating plot...")
     plt.figure(figsize=(10, 6))
     
-    for name, data in plot_data.items():
+    plot_names = list(plot_data.keys())
+    for i, name in enumerate(plot_names):
+        data = plot_data[name]
+        ls = 'solid'
+        if linestyles and i < len(linestyles):
+            ls = linestyles[i]
         plt.plot(data['thresholds'], data['ratios'], 
                 label=f'{name} (n={data["num_items"]})', 
-                linewidth=2)
+                linewidth=2, linestyle=ls)
     
     plt.xlabel('DreamSim Score Threshold', fontsize=12)
     
@@ -250,6 +262,20 @@ def main():
         default=1000,
         help="Number of threshold points to evaluate (default: 1000)"
     )
+    parser.add_argument(
+        "--labels",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Short display labels for each JSON file (one per --json_files entry)"
+    )
+    parser.add_argument(
+        "--linestyles",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Line styles for each JSON file (e.g. solid dashed dotted). One per --json_files entry."
+    )
     
     args = parser.parse_args()
     
@@ -266,7 +292,9 @@ def main():
         mode=args.mode,
         output_file=args.output_file,
         num_thresholds=args.num_thresholds,
-        base_dir=args.base_dir
+        base_dir=args.base_dir,
+        labels=args.labels,
+        linestyles=args.linestyles,
     )
     
     print("\nDone!")

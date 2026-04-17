@@ -25,36 +25,48 @@ except ImportError:
     raise
 
 
-def compute_dreamsim_distance(model, preprocess, img1_path, img2_path, device):
+def compute_dreamsim_distance(model, preprocess, img1_path, img2_path, device,
+                              resize_pred_to_gt=False, original_gt_path=None):
     """
     Compute DreamSim distance between two images.
-    
+
     Args:
         model: DreamSim model
         preprocess: DreamSim preprocessing function
-        img1_path: Path to first image
-        img2_path: Path to second image
+        img1_path: Path to saved GT image (may be downsampled)
+        img2_path: Path to predicted image
         device: torch device
-    
+        resize_pred_to_gt: If True, resize the predicted image to GT resolution
+                           (using LANCZOS) before passing both to DreamSim.
+        original_gt_path: When resize_pred_to_gt=True, use this higher-res GT image
+                          as the reference for both sizing and DreamSim comparison.
+                          Falls back to img1_path if not found.
+
     Returns:
         distance: DreamSim distance (lower is more similar)
     """
-
     try:
-        # Load images
-        img1 = Image.open(img1_path).convert('RGB')
+        # When resizing pred to GT, prefer the original high-res GT if provided
+        if resize_pred_to_gt and original_gt_path and os.path.exists(original_gt_path):
+            
+            img1 = Image.open(original_gt_path).convert('RGB')
+            print(f"Using original high-res GT: {original_gt_path}")
+        else:
+            img1 = Image.open(img1_path).convert('RGB')
+
         img2 = Image.open(img2_path).convert('RGB')
-        
-        # Preprocess images to tensors
+
+        if resize_pred_to_gt and img2.size != img1.size:
+            img2 = img2.resize(img1.size, Image.LANCZOS)
+
         img1_tensor = preprocess(img1).to(device)
         img2_tensor = preprocess(img2).to(device)
-        
-        # Compute distance directly using model
+
         with torch.no_grad():
             distance = model(img1_tensor, img2_tensor)
             if isinstance(distance, torch.Tensor):
                 distance = distance.item()
-        
+
         return distance
     except Exception as e:
         print(f"Error computing DreamSim for {img1_path} and {img2_path}: {e}")
@@ -110,17 +122,23 @@ def find_matching_images(gt_dir, pred_dir):
     return matching_pairs
 
 
-def compute_scores_for_directories(gt_dir, pred_dir, model, preprocess, device):
+def compute_scores_for_directories(gt_dir, pred_dir, model, preprocess, device,
+                                   resize_pred_to_gt=False,
+                                   original_gt_dir=None):
     """
     Compute DreamSim scores for all matching image pairs between two directories.
-    
+
     Args:
-        gt_dir: Path to GT images directory
+        gt_dir: Path to saved GT images directory (may be downsampled)
         pred_dir: Path to predicted images directory
         model: DreamSim model
         preprocess: DreamSim preprocessing function
         device: torch device
-    
+        resize_pred_to_gt: If True, resize each predicted image to GT resolution
+                           before computing DreamSim.
+        original_gt_dir: When resize_pred_to_gt=True, load GT images from this
+                         directory (original high-res) for both sizing and scoring.
+
     Returns:
         results: Dictionary with pairwise scores and statistics
     """
@@ -148,7 +166,18 @@ def compute_scores_for_directories(gt_dir, pred_dir, model, preprocess, device):
     # Compute scores for each pair
     pairwise_scores = []
     for filename_base, gt_path, pred_path in tqdm(matching_pairs, desc="Computing DreamSim scores"):
-        distance = compute_dreamsim_distance(model, preprocess, gt_path, pred_path, device)
+        # Resolve original high-res GT path if available (try common extensions)
+        original_gt_path = None
+        if resize_pred_to_gt and original_gt_dir:
+            for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                candidate = os.path.join(original_gt_dir, filename_base + ext)
+                if os.path.exists(candidate):
+                    original_gt_path = candidate
+                    break
+
+        distance = compute_dreamsim_distance(model, preprocess, gt_path, pred_path, device,
+                                             resize_pred_to_gt=resize_pred_to_gt,
+                                             original_gt_path=original_gt_path)
         
         if distance is not None:
             pairwise_scores.append({
@@ -246,6 +275,14 @@ def main(args):
         traceback.print_exc()
         return
     
+    if args.resize_pred_to_gt:
+        if args.wriva_path:
+            print(f"Mode: resize pred → original high-res GT ({args.wriva_path}/references/<scene>/)")
+        else:
+            print("Mode: resize pred → saved GT resolution before DreamSim")
+    else:
+        print("Mode: pass images as-is to DreamSim (default)")
+
     # Find all result folders
     print(f"\n{'='*80}")
     print("Finding all result folders")
@@ -269,7 +306,18 @@ def main(args):
         print(f"Processing: {folder_name}/{sequence_subdir}")
         print(f"{'='*80}")
         
-        results = compute_scores_for_directories(gt_dir, pred_dir, dreamsim_model, dreamsim_preprocess, device)
+        # Derive original high-res GT dir from wriva_path + scene_name
+        original_gt_dir = None
+        if args.resize_pred_to_gt and args.wriva_path:
+            original_gt_dir = os.path.join(args.wriva_path, "references", folder_name)
+            if not os.path.isdir(original_gt_dir):
+                print(f"  Warning: original GT dir not found at {original_gt_dir}, "
+                      f"falling back to saved GT")
+                original_gt_dir = None
+
+        results = compute_scores_for_directories(gt_dir, pred_dir, dreamsim_model, dreamsim_preprocess, device,
+                                                 resize_pred_to_gt=args.resize_pred_to_gt,
+                                                 original_gt_dir=original_gt_dir)
         
         if results is None:
             print(f"Warning: Failed to compute scores for {folder_name}/{sequence_subdir}")
@@ -347,19 +395,31 @@ def parse_args():
     parser.add_argument(
         "--base_dir",
         type=str,
-        default="/ocean/projects/cis250177p/qwu6/wriva_test_results_wan21_9to1_zero_rope_crop_all",
+        default="/ocean/projects/cis250177p/qwu6/wriva_test_results_wan21_6to1_BlendedMVS-239",
         help="Base directory containing result folders (logs_6DoF_all-to-all)"
     )
     parser.add_argument(
         "--output_file",
         type=str,
-        default="/ocean/projects/cis250177p/qwu6/wriva_test_results_wan21_9to1_zero_rope_crop_all/dreamsim_scores_wan21_9to1_zero_rope_crop_all.json",
-        help="Output JSON file to save results"
+        default="/ocean/projects/cis250177p/qwu6/wriva_test_results_wan21_6to1_BlendedMVS-239/dreamsim_scores.json"
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print all pairwise scores and per-folder summary"
+    )
+    parser.add_argument(
+        "--resize_pred_to_gt",
+        action="store_true",
+        help="Resize predicted image to GT resolution (LANCZOS) before DreamSim scoring."
+    )
+    parser.add_argument(
+        "--wriva_path",
+        type=str,
+        default=None,
+        help="Path to WRIVA dataset root (e.g. /ocean/projects/cis250200p/mjeon2/datasets/wriva). "
+             "When set with --resize_pred_to_gt, loads the original high-res GT from "
+             "<wriva_path>/references/<scene>/ instead of the saved (possibly downsampled) GT."
     )
     return parser.parse_args()
 

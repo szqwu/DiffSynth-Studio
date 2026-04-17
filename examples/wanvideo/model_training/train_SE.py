@@ -34,6 +34,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         reverse_pred_order=False,
         use_prope=False,
         zero_temporal_rope=False,
+        use_rayrope=False,
     ):
         super().__init__()
         # Warning
@@ -45,6 +46,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.reverse_pred_order = reverse_pred_order
         self.use_prope = use_prope
         self.zero_temporal_rope = zero_temporal_rope
+        self.use_rayrope = use_rayrope
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
@@ -87,6 +89,12 @@ class WanTrainingModule(DiffusionTrainingModule):
             self.pipe.dit.reverse_pred_order = True
             if self.pipe.dit2 is not None:
                 self.pipe.dit2.reverse_pred_order = True
+
+        # RayRoPE: add d_proj layers to each SelfAttention block
+        if use_rayrope:
+            self._add_rayrope_layers(self.pipe.dit, device)
+            if self.pipe.dit2 is not None:
+                self._add_rayrope_layers(self.pipe.dit2, device)
         
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
@@ -126,12 +134,12 @@ class WanTrainingModule(DiffusionTrainingModule):
             from diffsynth.core import load_state_dict as _load_sd
             ckpt_sd = _load_sd(resume_checkpoint)
             extra_state = {k: v for k, v in ckpt_sd.items()
-                          if "patch_embedding" in k or "control_adapter" in k}
+                          if "patch_embedding" in k or "control_adapter" in k or "d_proj" in k}
             if extra_state:
                 load_result = getattr(self.pipe, lora_base_model).load_state_dict(extra_state, strict=False)
-                print(f"Resume: loaded {len(extra_state)} extra keys (patch_embedding/control_adapter) from {resume_checkpoint}")
+                print(f"Resume: loaded {len(extra_state)} extra keys (patch_embedding/control_adapter/d_proj) from {resume_checkpoint}")
             else:
-                print(f"Resume warning: no patch_embedding/control_adapter keys found in {resume_checkpoint}")
+                print(f"Resume warning: no patch_embedding/control_adapter/d_proj keys found in {resume_checkpoint}")
             del ckpt_sd
         
         # Store other configs
@@ -293,6 +301,21 @@ class WanTrainingModule(DiffusionTrainingModule):
                     param.requires_grad = True
                 print(f"Unfroze control_adapter in dit2 for full training")
         
+    def _add_rayrope_layers(self, model, device):
+        """Add d_proj layers to each SelfAttention block for RayRoPE depth prediction."""
+        if model is None:
+            return
+        import torch.nn as nn
+        model.use_rayrope = True
+        for block in model.blocks:
+            sa = block.self_attn
+            sa.use_rayrope = True
+            sa.d_proj = nn.Linear(sa.dim, 2)
+            nn.init.zeros_(sa.d_proj.weight)
+            sa.d_proj.bias = nn.Parameter(torch.tensor([0.0, 3.0]))
+            sa.d_proj = sa.d_proj.to(device=device, dtype=torch.bfloat16)
+        print(f"Added d_proj layers to {len(model.blocks)} SelfAttention blocks for RayRoPE")
+
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
             if extra_input == "input_image":
@@ -310,7 +333,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_nega = {}
         # Determine whether camera_poses_norm and intrinsics should be passed through
         # They are needed for: camera_adapter (SimpleAdapter) and/or prope (attention-level encoding)
-        need_camera_params = self.use_camera_adapter or self.use_prope
+        need_camera_params = self.use_camera_adapter or self.use_prope or self.use_rayrope
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
@@ -322,6 +345,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "intrinsics": data.get("intrinsics", None) if need_camera_params else None,
             "use_prope": self.use_prope,
             "zero_temporal_rope": self.zero_temporal_rope,
+            "use_rayrope": self.use_rayrope,
             "height": data["input_images"][0].size[1],
             "width": data["input_images"][0].size[0],
             "num_frames": len(data["target_images"]),
@@ -398,6 +422,12 @@ def wan_parser():
                              "temporal frequencies with identity (1+0j). Spatial (height/width) "
                              "RoPE remains unchanged. This removes temporal position information "
                              "so the model treats all frames as having the same temporal position.")
+    parser.add_argument("--use_rayrope", default=False, action="store_true",
+                        help="Use hybrid RayRoPE encoding. Within each (t,h,w) axis, replaces "
+                             "the low-frequency 6 complex dims with geometry-aware RayRoPE "
+                             "(camera center + ray direction + predicted depth). Adds per-layer "
+                             "d_proj heads for depth prediction. Requires camera_poses_norm and "
+                             "intrinsics from the dataset. Mutually exclusive with --use_prope.")
     parser.add_argument("--num_dataset_samples", type=int, default=1000, help="Number of dataset samples to use for training.")
     parser.add_argument("--no_pixel_unshuffle", default=False, action="store_true",
                         help="Do not use pixel unshuffle to downscale the raymap to 1/8 resolution.")
@@ -424,6 +454,11 @@ def wan_parser():
     parser.add_argument("--combined_dataset_ratios", type=float, nargs="+",
                         default=[4, 3, 3],
                         help="Sampling ratios for eschernet_combined mode.")
+    parser.add_argument("--resize_mode", type=str, default="crop",
+                        choices=["crop", "stretch"],
+                        help="Image resize mode for training. 'crop' = uniform-scale + "
+                             "center-crop (default). 'stretch' = resize to exact target "
+                             "dimensions (matches inference stretch mode).")
     return parser
 
 
@@ -449,6 +484,7 @@ if __name__ == "__main__":
             num_output_frames=args.num_output_frames,
             min_input_frames=args.min_input_frames,
             min_output_frames=args.min_output_frames,
+            resize_mode=args.resize_mode,
         )
     else:
         assert args.dataset_base_path, (
@@ -504,6 +540,7 @@ if __name__ == "__main__":
         reverse_pred_order=args.reverse_pred_order,
         use_prope=args.use_prope,
         zero_temporal_rope=args.zero_temporal_rope,
+        use_rayrope=args.use_rayrope,
     )
     model_logger = ModelLogger(
         args.output_path,

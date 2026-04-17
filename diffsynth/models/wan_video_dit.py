@@ -123,11 +123,12 @@ class AttentionModule(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, use_rayrope: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.use_rayrope = use_rayrope
 
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -138,33 +139,73 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, prope_attn=None):
+        if use_rayrope:
+            self.d_proj = nn.Linear(dim, 2)
+            nn.init.zeros_(self.d_proj.weight)
+            self.d_proj.bias = nn.Parameter(torch.tensor([0.0, 3.0]))
+
+    def forward(self, x, freqs, prope_attn=None, rayrope_data=None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         if prope_attn is not None:
             # PRoPE path: camera-geometry-aware positional encoding
-            # Reshape to (B, num_heads, S, head_dim) for PRoPE
             q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
             k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
             v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
             q = prope_attn._apply_to_q(q)
             k = prope_attn._apply_to_kv(k)
             v = prope_attn._apply_to_kv(v)
-            # PRoPE's projection matrices are not norm-preserving (unlike RoPE rotations),
-            # so Q/K magnitudes can grow unboundedly, causing attention logit explosion.
-            # Normalize Q and K to restore the expected scale for dot-product attention.
             q = F.normalize(q, dim=-1) * (q.shape[-1] ** 0.5)
             k = F.normalize(k, dim=-1) * (k.shape[-1] ** 0.5)
             x = F.scaled_dot_product_attention(q, k, v)
             x = prope_attn._apply_to_o(x)
             x = rearrange(x, "b n s d -> b s (n d)")
+        elif rayrope_data is not None:
+            x = self._forward_rayrope(q, k, v, x, rayrope_data)
         else:
             # Original path: 3D grid RoPE
             q = rope_apply(q, freqs, self.num_heads)
             k = rope_apply(k, freqs, self.num_heads)
             x = self.attn(q, k, v)
         return self.o(x)
+
+    def _forward_rayrope(self, q, k, v, x, rayrope_data):
+        from .rayrope import interleave_grid_rayrope
+
+        rayrope_module = rayrope_data["rayrope_module"]
+        grid_t = rayrope_data["grid_t"]  # (S, 1, 16) complex
+        grid_h = rayrope_data["grid_h"]  # (S, 1, 15) complex
+        grid_w = rayrope_data["grid_w"]  # (S, 1, 15) complex
+
+        raw_d = self.d_proj(x)  # (B, S, 2)
+        freqs_Q_rr, all_freqs_K_rr = rayrope_module.build_rayrope_freqs(raw_d)
+
+        combined_Q = interleave_grid_rayrope(grid_t, grid_h, grid_w, freqs_Q_rr)
+        q = rope_apply(q, combined_Q, self.num_heads)
+
+        num_cameras = rayrope_module.num_cameras
+        num_patches = rayrope_module.num_patches
+
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k_base = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v_base = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        out = torch.zeros_like(q)
+
+        for cam_idx in range(num_cameras):
+            combined_K = interleave_grid_rayrope(
+                grid_t, grid_h, grid_w, all_freqs_K_rr[cam_idx]
+            )
+            k_enc = rope_apply(k, combined_K, self.num_heads)
+            k_enc = rearrange(k_enc, "b s (n d) -> b n s d", n=self.num_heads)
+
+            q_slice = q[:, :, cam_idx * num_patches : (cam_idx + 1) * num_patches, :]
+            out_slice = F.scaled_dot_product_attention(
+                q_slice.contiguous(), k_enc.contiguous(), v_base.contiguous()
+            )
+            out[:, :, cam_idx * num_patches : (cam_idx + 1) * num_patches, :] = out_slice
+
+        return rearrange(out, "b n s d -> b s (n d)")
 
 
 class CrossAttention(nn.Module):
@@ -214,13 +255,13 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6, use_rayrope: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
+        self.self_attn = SelfAttention(dim, num_heads, eps, use_rayrope=use_rayrope)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -231,10 +272,9 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, prope_attn=None):
+    def forward(self, x, context, t_mod, freqs, prope_attn=None, rayrope_data=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
-        # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
         if has_seq:
@@ -243,7 +283,7 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, prope_attn=prope_attn))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, prope_attn=prope_attn, rayrope_data=rayrope_data))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -314,6 +354,7 @@ class WanModel(torch.nn.Module):
         fuse_vae_embedding_in_latents_multiple: bool = False,
         seperated_encoding: bool = False,
         reverse_pred_order: bool = False,
+        use_rayrope: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -332,6 +373,7 @@ class WanModel(torch.nn.Module):
         self.fuse_vae_embedding_in_latents_multiple = fuse_vae_embedding_in_latents_multiple
         self.seperated_encoding = seperated_encoding
         self.reverse_pred_order = reverse_pred_order
+        self.use_rayrope = use_rayrope
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(
@@ -347,7 +389,7 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps, use_rayrope=use_rayrope)
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -405,6 +447,7 @@ class WanModel(torch.nn.Module):
                 Ks: Optional[torch.Tensor] = None,
                 image_hw: Optional[Tuple[int, int]] = None,
                 zero_temporal_rope: bool = False,
+                use_rayrope: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -418,19 +461,50 @@ class WanModel(torch.nn.Module):
             context = torch.cat([clip_embdding, context], dim=1)
         
         x, (f, h, w) = self.patchify(x)
+
+        # Build RayRoPE data if enabled
+        rayrope_data = None
+        if self.use_rayrope and use_rayrope and viewmats is not None and Ks is not None and image_hw is not None:
+            from .rayrope import HybridRayRoPE
+            rayrope_module = HybridRayRoPE(
+                w2cs=viewmats.to(dtype=torch.float32, device=x.device),
+                Ks=Ks.to(dtype=torch.float32, device=x.device),
+                patches_x=w, patches_y=h,
+                image_width=image_hw[1], image_height=image_hw[0],
+                num_rayrope_freqs=3,
+            )
+            # Build truncated grid freqs for each axis (high-freq bands only)
+            # Original partition: f_dim = dim - 2*(dim//3), h_dim = dim//3, w_dim = dim//3
+            # In complex dims: f=22, h=21, w=21. Truncate to f=16, h=15, w=15.
+            f_freqs = self.freqs[0][:f]
+            if zero_temporal_rope:
+                f_freqs = torch.ones_like(f_freqs)
+            grid_t = f_freqs[:, :16].view(f, 1, 1, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+            grid_h = self.freqs[1][:h, :15].view(1, h, 1, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+            grid_w = self.freqs[2][:w, :15].view(1, 1, w, -1).expand(f, h, w, -1).reshape(f * h * w, 1, -1).to(x.device)
+
+            rayrope_data = {
+                "rayrope_module": rayrope_module,
+                "grid_t": grid_t,
+                "grid_h": grid_h,
+                "grid_w": grid_w,
+            }
+            # When rayrope is active, freqs is not used by SelfAttention but still
+            # needed by the block signature. Build a dummy.
+            freqs = torch.ones(f * h * w, 1, self.dim // self.num_heads // 2, device=x.device, dtype=torch.complex64)
+        else:
+            f_freqs = self.freqs[0][:f]
+            if zero_temporal_rope:
+                f_freqs = torch.ones_like(f_freqs)
+            freqs = torch.cat([
+                f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
         
-        f_freqs = self.freqs[0][:f]
-        if zero_temporal_rope:
-            f_freqs = torch.ones_like(f_freqs)
-        freqs = torch.cat([
-            f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-        
-        # Prepare PRoPE if camera parameters are provided
+        # Prepare PRoPE if camera parameters are provided (mutually exclusive with rayrope)
         prope_attn = None
-        if viewmats is not None and Ks is not None and image_hw is not None:
+        if rayrope_data is None and viewmats is not None and Ks is not None and image_hw is not None:
             from .prope import PropeDotProductAttention
             head_dim = self.dim // self.num_heads
             prope_attn = PropeDotProductAttention(
@@ -443,9 +517,9 @@ class WanModel(torch.nn.Module):
                 Ks.to(dtype=x.dtype, device=x.device),
             )
         
-        def create_custom_forward(module, _prope_attn=None):
+        def create_custom_forward(module, _prope_attn=None, _rayrope_data=None):
             def custom_forward(*inputs):
-                return module(*inputs, prope_attn=_prope_attn)
+                return module(*inputs, prope_attn=_prope_attn, rayrope_data=_rayrope_data)
             return custom_forward
 
         for block in self.blocks:
@@ -453,18 +527,18 @@ class WanModel(torch.nn.Module):
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block, prope_attn),
+                            create_custom_forward(block, prope_attn, rayrope_data),
                             x, context, t_mod, freqs,
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block, prope_attn),
+                        create_custom_forward(block, prope_attn, rayrope_data),
                         x, context, t_mod, freqs,
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, prope_attn=prope_attn)
+                x = block(x, context, t_mod, freqs, prope_attn=prope_attn, rayrope_data=rayrope_data)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

@@ -33,16 +33,13 @@ import torch
 # ──────────────────────────────────────────────────────────────────────────────
 # Default configuration
 # ──────────────────────────────────────────────────────────────────────────────
-# DEFAULT_MODEL_H = 480
-# DEFAULT_MODEL_W = 832
-# DEFAULT_EVAL_SIZE = 480
-DEFAULT_MODEL_H = 192
-DEFAULT_MODEL_W = 336
-DEFAULT_EVAL_SIZE = 192
+DEFAULT_MODEL_H = 480
+DEFAULT_MODEL_W = 832
+DEFAULT_EVAL_SIZE = 480
 DEFAULT_NUM_INPUT_FRAMES = 6
 
-DEFAULT_DL3DV_META_PATH = "/data2/qiwu2/dl3dv10"
-DEFAULT_DL3DV_DATA_PATH = "/data2/qiwu2/DL3DV-10K-test"
+DEFAULT_DL3DV_META_PATH = "/ocean/projects/cis250177p/qwu6/dl3dv10"
+DEFAULT_DL3DV_DATA_PATH = "/ocean/projects/cis250177p/qwu6/dl3dv10"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,7 +77,7 @@ def load_gt_frame(scene_hash, frame_idx, transforms_data, dl3dv_data_path,
     """
     Load a GT frame from DL3DV-10K and bring it to model resolution.
     """
-    scene_data_path = os.path.join(dl3dv_data_path, scene_hash, "nerfstudio")
+    scene_data_path = os.path.join(dl3dv_data_path, scene_hash)
     frame_data = transforms_data["frames"][frame_idx]
     file_path = frame_data["file_path"].replace("images/", "images_4/")
     img_path = os.path.join(scene_data_path, file_path)
@@ -143,22 +140,24 @@ def init_ssim():
 def init_lpips():
     """Load LPIPS (AlexNet) model."""
     import lpips
-    model = lpips.LPIPS(net="alex").cuda().eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = lpips.LPIPS(net="alex").to(device).eval()
     return model
 
 
 def compute_lpips(lpips_model, pred, gt):
     """Compute LPIPS between two uint8 numpy arrays (H, W, 3)."""
+    device = next(lpips_model.parameters()).device
     pred_t = torch.from_numpy(pred).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
     gt_t = torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
     with torch.no_grad():
-        return lpips_model(pred_t.cuda(), gt_t.cuda()).item()
+        return lpips_model(pred_t.to(device), gt_t.to(device)).item()
 
 
 def init_dreamsim():
     """Load DreamSim model."""
     from dreamsim import dreamsim
-    model, preprocess = dreamsim(pretrained=True, device="cuda")
+    model, preprocess = dreamsim(pretrained=True, device="cpu" if not torch.cuda.is_available() else "cuda")
     return model, preprocess
 
 
@@ -167,8 +166,9 @@ def compute_dreamsim(dreamsim_model, dreamsim_preprocess, pred, gt):
     pred_pil = Image.fromarray(pred)
     gt_pil = Image.fromarray(gt)
 
-    pred_t = dreamsim_preprocess(pred_pil).to("cuda")
-    gt_t = dreamsim_preprocess(gt_pil).to("cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pred_t = dreamsim_preprocess(pred_pil).to(device)
+    gt_t = dreamsim_preprocess(gt_pil).to(device)
 
     # Ensure 4D tensors (batch dim)
     if pred_t.dim() == 3:
@@ -240,7 +240,7 @@ def process_scene(scene_hash, results_dir, dl3dv_meta_path, dl3dv_data_path,
     test_ids = split_data["test_ids"]
 
     # ── Load transforms.json ──────────────────────────────────────────────
-    transforms_file = os.path.join(dl3dv_data_path, scene_hash, "nerfstudio", "transforms.json")
+    transforms_file = os.path.join(dl3dv_data_path, scene_hash, "transforms.json")
     if not os.path.exists(transforms_file):
         print(f"  [SKIP] Transforms not found: {transforms_file}")
         return None

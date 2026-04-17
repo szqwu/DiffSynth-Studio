@@ -108,16 +108,30 @@ def load_pipeline(args):
         for k in checkpoint.keys()
     )
 
+    # If rayrope is enabled, add d_proj layers before loading checkpoint
+    if getattr(args, 'use_rayrope', False):
+        import torch.nn as nn
+        pipe.dit.use_rayrope = True
+        for block in pipe.dit.blocks:
+            sa = block.self_attn
+            sa.use_rayrope = True
+            sa.d_proj = nn.Linear(sa.dim, 2)
+            nn.init.zeros_(sa.d_proj.weight)
+            sa.d_proj.bias = nn.Parameter(torch.tensor([0.0, 3.0]))
+            sa.d_proj = sa.d_proj.to(device="cuda", dtype=torch.bfloat16)
+        print(f"Added d_proj layers to {len(pipe.dit.blocks)} blocks for RayRoPE")
+
     if has_lora_keys:
         pipe.load_lora(pipe.dit, state_dict=checkpoint, alpha=1.0)
         print("LoRA weights loaded")
 
-        patch_emb_state = {k: v for k, v in checkpoint.items() if "patch_embedding" in k}
-        if patch_emb_state:
-            pipe.dit.load_state_dict(patch_emb_state, strict=False)
-            print(f"Loaded {len(patch_emb_state)} patch_embedding parameters")
+        extra_state = {k: v for k, v in checkpoint.items()
+                       if "patch_embedding" in k or "d_proj" in k}
+        if extra_state:
+            pipe.dit.load_state_dict(extra_state, strict=False)
+            print(f"Loaded {len(extra_state)} extra parameters (patch_embedding/d_proj)")
         else:
-            print("Warning: No patch_embedding weights found in checkpoint!")
+            print("Warning: No patch_embedding/d_proj weights found in checkpoint!")
     else:
         load_result = pipe.dit.load_state_dict(checkpoint, strict=False)
         missing = [k for k in load_result.missing_keys if k not in checkpoint]
@@ -507,7 +521,8 @@ def process_scene(
     # ── Paths ─────────────────────────────────────────────────────────────
     input_dir = os.path.join(args.wriva_path, "inputs", scene_name)
     ref_dir = os.path.join(args.wriva_path, "references", scene_name)
-    colmap_dir = os.path.join(args.wriva_path, "inputs_colmap", scene_name)
+    inputs_colmap_root = args.inputs_colmap_path if args.inputs_colmap_path else os.path.join(args.wriva_path, "inputs_colmap")
+    colmap_dir = os.path.join(inputs_colmap_root, scene_name)
     ref_json = os.path.join(args.wriva_path, "references_colmap", f"{scene_name}.json")
 
     print(f"\n{'='*80}")
@@ -683,6 +698,12 @@ def process_scene(
         )
         if args.zero_temporal_rope:
             pipe_kwargs["zero_temporal_rope"] = True
+        if args.use_rayrope:
+            pipe_kwargs["use_rayrope"] = True
+            # RayRoPE needs c2w poses (camera_poses_norm) and intrinsics
+            all_c2w = np.linalg.inv(all_w2c)
+            pipe_kwargs["camera_poses_norm"] = torch.from_numpy(all_c2w).float().to("cuda")
+            pipe_kwargs["intrinsics"] = torch.from_numpy(all_K).float().to("cuda")
 
         video = pipe(**pipe_kwargs)
 
@@ -807,14 +828,15 @@ def process_scene(
 # Scene discovery
 # ══════════════════════════════════════════════════════════════════════════════
 
-def discover_valid_scenes(wriva_path):
+def discover_valid_scenes(wriva_path, inputs_colmap_path=None):
     """
     Return sorted list of scene names that have all four required sub-paths:
-    inputs/, references/, inputs_colmap/, references_colmap/*.json
+    inputs/, references/, inputs_colmap/ (or override), references_colmap/*.json
     """
     inputs = set(os.listdir(os.path.join(wriva_path, "inputs")))
     refs = set(os.listdir(os.path.join(wriva_path, "references")))
-    ic = set(os.listdir(os.path.join(wriva_path, "inputs_colmap")))
+    colmap_root = inputs_colmap_path if inputs_colmap_path else os.path.join(wriva_path, "inputs_colmap")
+    ic = set(os.listdir(colmap_root))
     rc = set(
         f.replace(".json", "")
         for f in os.listdir(os.path.join(wriva_path, "references_colmap"))
@@ -833,18 +855,28 @@ def main(args):
     torch.manual_seed(args.seed)
 
     # ── Discover & select scenes ──────────────────────────────────────────
-    all_scenes = discover_valid_scenes(args.wriva_path)
-    print(f"Found {len(all_scenes)} valid scenes in {args.wriva_path}")
+    all_scenes = discover_valid_scenes(args.wriva_path, args.inputs_colmap_path)
+    colmap_src = args.inputs_colmap_path if args.inputs_colmap_path else os.path.join(args.wriva_path, "inputs_colmap")
+    print(f"Found {len(all_scenes)} valid scenes (COLMAP from: {colmap_src})")
 
     if args.scenes:
-        # Use explicitly provided scenes
         scenes = args.scenes
     else:
-        # Randomly sample num_scenes
         if args.num_scenes >= len(all_scenes):
             scenes = all_scenes
         else:
             scenes = sorted(random.sample(all_scenes, args.num_scenes))
+
+    # Shard scenes across GPUs for parallel evaluation
+    if args.num_shards > 1:
+        total = len(scenes)
+        shard_size = (total + args.num_shards - 1) // args.num_shards
+        start = args.shard_id * shard_size
+        end = min(start + shard_size, total)
+        scenes = scenes[start:end]
+        print(f"Shard {args.shard_id}/{args.num_shards}: scenes [{start}:{end}] "
+              f"({len(scenes)} of {total})")
+
     print(f"Will evaluate on {len(scenes)} scenes")
 
     print(f"Model resolution: {args.height}x{args.width}")
@@ -966,6 +998,11 @@ if __name__ == "__main__":
     parser.add_argument("--wriva_path", type=str,
                         default="/ocean/projects/cis250200p/mjeon2/datasets/wriva",
                         help="Base path to the WRIVA dataset")
+    parser.add_argument("--inputs_colmap_path", type=str, default=None,
+                        help="Override path for inputs_colmap directory "
+                             "(default: <wriva_path>/inputs_colmap). "
+                             "Use this to swap in alternative COLMAP reconstructions "
+                             "e.g. --inputs_colmap_path /ocean/projects/cis250200p/mehark/inputs_mapa_with_colmap")
     parser.add_argument("--output_path", type=str, required=True,
                         help="Output directory for results")
 
@@ -999,11 +1036,21 @@ if __name__ == "__main__":
     parser.add_argument("--zero_temporal_rope", action="store_true", default=False,
                         help="Zero out temporal RoPE (identity rotation for frame axis). "
                              "Requires checkpoint trained with --zero_temporal_rope.")
+    parser.add_argument("--use_rayrope", action="store_true", default=False,
+                        help="Use hybrid RayRoPE encoding. Replaces low-frequency dims of each "
+                             "axis with geometry-aware RayRoPE. Requires checkpoint trained "
+                             "with --use_rayrope.")
 
     # Metrics
     parser.add_argument("--use_dreamsim", action="store_true")
     parser.add_argument("--use_ssim", action="store_true")
     parser.add_argument("--use_lpips", action="store_true")
+
+    # Sharding for multi-GPU parallel evaluation
+    parser.add_argument("--shard_id", type=int, default=0,
+                        help="Shard index for multi-GPU parallelism (0-indexed)")
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Total number of shards (set to number of GPUs)")
 
     # Misc
     parser.add_argument("--seed", type=int, default=42)

@@ -1,20 +1,18 @@
 #!/bin/bash
 
 # Script to run Wan2.1 M-to-N NVS evaluation on DL3DV-10K scenes
-# Processes scenes in parallel across 5 GPUs, 2 scenes per GPU
+# Processes 10 scenes in parallel across 2 GPUs, 5 scenes per GPU
 
 # ── M-to-N configuration ──────────────────────────────────────────────────────
-NUM_INPUT_FRAMES="${1:-3}"
-NUM_OUTPUT_FRAMES="${2:-4}"
+NUM_INPUT_FRAMES="${1:-6}"
+NUM_OUTPUT_FRAMES="${2:-1}"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-69-new.safetensors"
-# output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-69-new"
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
-output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope-480p_epoch-59"
-GPU_IDS=( 2 3 4 5 6)
-# GPU_IDS=(  7 )
-SCENES_PER_GPU=2
+checkpoint_path="/ocean/projects/cis250177p/qwu6/DiffSynth-Studio/examples/wanvideo/models/train/Wan2.1-SE-14B-lora32-zero-temporal-rope_480p_T10_2/epoch-19.safetensors"
+output_path="/ocean/projects/cis250177p/qwu6/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope-480p_t10_epoch-19"
+dl3dv_path="/ocean/projects/cis250177p/qwu6/dl3dv10"
+GPU_IDS=(0 1)
+SCENES_PER_GPU=5
 
 # All 10 DL3DV-10K test scenes
 SCENES=(
@@ -59,6 +57,8 @@ for i in "${!GPU_IDS[@]}"; do
     CUDA_VISIBLE_DEVICES=$gpu_id python test_wan2.1_6to1.py \
         --checkpoint_path $checkpoint_path \
         --output_path $output_path \
+        --dl3dv_meta_path $dl3dv_path \
+        --dl3dv_data_path $dl3dv_path \
         --scenes ${gpu_scenes[@]} \
         --num_input_frames $NUM_INPUT_FRAMES \
         --num_output_frames $NUM_OUTPUT_FRAMES \

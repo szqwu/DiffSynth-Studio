@@ -302,7 +302,7 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
 
     # Paths
     scene_meta_path = os.path.join(args.dl3dv_meta_path, scene_hash)
-    scene_data_path = os.path.join(args.dl3dv_data_path, scene_hash, "nerfstudio")
+    scene_data_path = os.path.join(args.dl3dv_data_path, scene_hash)
 
     print(f"\n{'='*80}")
     print(f"[{scene_idx+1}/{total_scenes}] Processing scene: {scene_hash}")
