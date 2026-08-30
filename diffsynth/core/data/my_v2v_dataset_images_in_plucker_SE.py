@@ -376,6 +376,7 @@ class my_cognvs_dataset(Dataset):
             num_output_frames=None,
             min_input_frames=3,
             min_output_frames=1,
+            raymap_downsample_factor=8,
         ):
 
         self.base_path = base_path
@@ -409,6 +410,7 @@ class my_cognvs_dataset(Dataset):
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         self.no_pixel_unshuffle = no_pixel_unshuffle
+        self.raymap_downsample_factor = raymap_downsample_factor
         self.load_from_cache = False  # This dataset doesn't use cached data
         self.reverse_pred_order = reverse_pred_order
 
@@ -705,8 +707,10 @@ class my_cognvs_dataset(Dataset):
             else:
                 # Normalize to last camera (the prediction target)
                 _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
+                # _, camera_poses_norm, _ = normalize_w2c_make_cam0_origin(w2cs)
+                # print("camera first origin")
 
-            raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width, no_pixel_unshuffle=self.no_pixel_unshuffle)
+            raymaps = get_plucker_rays(camera_poses_norm, torch.from_numpy(intrinsics).float(), height=self.height, width=self.width, no_pixel_unshuffle=self.no_pixel_unshuffle, downsample_factor=self.raymap_downsample_factor)
             # print(f"raymaps shape: {raymaps.shape}")
             # Convert to torch tensor if it's numpy
             if isinstance(raymaps, np.ndarray):
@@ -727,12 +731,18 @@ class my_cognvs_dataset(Dataset):
         else:
             logger.warning(f"Could not load camera parameters for {input_video_path}, raymaps not available")
             metadata["has_camera_params"] = False
-            # Create dummy camera_conditions with proper shape
-            camera_conditions = torch.zeros(self.num_frames, 
-                6 * self.height_division_factor * self.width_division_factor, 
-                self.height // self.height_division_factor, 
-                self.width // self.width_division_factor
-            )
+            # Create dummy camera_conditions with proper shape (must match the raymap
+            # PixelUnshuffle(downsample_factor) layout used when camera params exist).
+            _df = self.raymap_downsample_factor
+            if self.no_pixel_unshuffle:
+                camera_conditions = torch.zeros(self.num_frames, 6,
+                    self.height // _df, self.width // _df)
+            else:
+                camera_conditions = torch.zeros(self.num_frames,
+                    6 * _df * _df,
+                    self.height // _df,
+                    self.width // _df
+                )
             camera_poses_norm_out = torch.eye(4).unsqueeze(0).repeat(self.num_frames, 1, 1)
             intrinsics_out = torch.eye(3).unsqueeze(0).repeat(self.num_frames, 1, 1)
 

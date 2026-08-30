@@ -33,6 +33,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         reverse_pred_order=False,
         use_prope=False,
         zero_temporal_rope=False,
+        zero_xy_rope=False,
+        aat_frame_attention=False,
+        use_input_encoder=False,
+        trainable_input_vae=False,
+        use_input_latent_mlp=True,
+        input_prefix_attention=False,
     ):
         super().__init__()
         # Warning
@@ -44,6 +50,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.reverse_pred_order = reverse_pred_order
         self.use_prope = use_prope
         self.zero_temporal_rope = zero_temporal_rope
+        self.zero_xy_rope = zero_xy_rope
+        self.aat_frame_attention = aat_frame_attention
+        self.use_input_encoder = use_input_encoder
+        self.trainable_input_vae = trainable_input_vae
+        # Input-encoder variants:
+        #   use_input_latent_mlp: create the zero-init residual MLP (z0 -> z0+MLP(z0)).
+        #     Drop it (False) for the 14B "frozen VAE" setup.
+        #   input_prefix_attention: let the clean input tokens transform through the
+        #     DiT layers (no per-layer replacement) but mask attention so context
+        #     attends only to context -> a step-invariant prefix.
+        self.use_input_latent_mlp = use_input_latent_mlp
+        self.input_prefix_attention = input_prefix_attention
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
@@ -60,6 +78,45 @@ class WanTrainingModule(DiffusionTrainingModule):
             self.modify_model_channels(self.pipe.dit, new_in_dim, device)
             if self.pipe.dit2 is not None:
                 self.modify_model_channels(self.pipe.dit2, new_in_dim, device)
+        
+        # Input-encoder mode: a separate (optionally trainable) VAE encoder for the
+        # conditioning frames + a zero-init residual MLP. The encoded input latents
+        # are read via true per-layer cross-attention (per-layer token replacement)
+        # inside model_fn_wan_video. Must run BEFORE switch_pipe_to_training_mode so
+        # freeze_except sees these modules; they are (re)enabled afterward.
+        if use_input_encoder:
+            import copy
+            from diffsynth.models.wan_video_dit import InputLatentResidualMLP
+            for m in [self.pipe.dit, self.pipe.dit2]:
+                if m is None:
+                    continue
+                m.use_input_encoder = True
+                # Propagate the transform-through-layers + prefix-mask flags (the
+                # WanModel ctor set them when channels were modified; set again here
+                # to cover the no-modify_channels fallback path).
+                m.per_layer_input_replacement = not input_prefix_attention
+                m.input_prefix_attention = input_prefix_attention
+                if use_input_latent_mlp:
+                    # Fallback: create the zero-init residual MLP if channels were not
+                    # modified (the WanModel ctor otherwise creates it).
+                    if getattr(m, "input_latent_mlp", None) is None:
+                        m.input_latent_mlp = InputLatentResidualMLP(m.out_dim).to(device=device, dtype=torch.bfloat16)
+                else:
+                    # Explicitly drop the MLP (e.g. the 14B frozen-VAE setup).
+                    m.input_latent_mlp = None
+            # Conditioning-frame VAE encoder. When trainable, make a separate copy so
+            # gradients don't touch the main (frozen) VAE. When frozen, reuse the main
+            # VAE directly (alias) to avoid a redundant multi-GB copy.
+            if trainable_input_vae:
+                self.pipe.input_vae = copy.deepcopy(self.pipe.vae)
+                print(f"Input-encoder enabled: created separate TRAINABLE input_vae "
+                      f"(copy of vae); prefix_attention={input_prefix_attention}, "
+                      f"input_latent_mlp={use_input_latent_mlp}")
+            else:
+                self.pipe.input_vae = self.pipe.vae
+                print(f"Input-encoder enabled: input_vae aliased to the frozen main vae; "
+                      f"prefix_attention={input_prefix_attention}, "
+                      f"input_latent_mlp={use_input_latent_mlp}")
         
         # Camera adapter mode: use the pretrained SimpleAdapter from the checkpoint.
         # If the checkpoint doesn't have one, create a new (randomly initialized) adapter.
@@ -104,6 +161,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         if modify_channels and new_in_dim is not None and lora_base_model is not None:
             self.unfreeze_patch_embedding(self.pipe, lora_base_model)
 
+        # Input-encoder mode: unfreeze the zero-init residual MLP (always trained)
+        # and, optionally, the separate input VAE encoder.
+        if use_input_encoder:
+            self.unfreeze_input_encoder(self.pipe, trainable_input_vae)
+
         # If camera adapter mode, unfreeze the control_adapter for training
         # if use_camera_adapter and lora_base_model is not None:
         #     self.unfreeze_control_adapter(self.pipe, lora_base_model)
@@ -125,7 +187,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             from diffsynth.core import load_state_dict as _load_sd
             ckpt_sd = _load_sd(resume_checkpoint)
             extra_state = {k: v for k, v in ckpt_sd.items()
-                          if "patch_embedding" in k or "control_adapter" in k}
+                          if "patch_embedding" in k or "control_adapter" in k or "input_latent_mlp" in k}
             if extra_state:
                 load_result = getattr(self.pipe, lora_base_model).load_state_dict(extra_state, strict=False)
                 print(f"Resume: loaded {len(extra_state)} extra keys (patch_embedding/control_adapter) from {resume_checkpoint}")
@@ -189,14 +251,32 @@ class WanTrainingModule(DiffusionTrainingModule):
             has_ref_conv=model.has_ref_conv,
             add_control_adapter=has_adapter,
             in_dim_control_adapter=24 if has_adapter else None,
-            seperated_timestep=model.seperated_timestep,
-            require_vae_embedding=model.require_vae_embedding,
+            # Per-token timestep (context=0, target=t) needs seperated_timestep=True.
+            # The 5B base already has it True; the 14B base has it False, so force it
+            # on whenever we fuse the clean input latents into multiple leading slots.
+            seperated_timestep=model.seperated_timestep or self.fuse_vae_embedding_in_latents_multiple,
+            # In input-encoder mode the clean conditioning frames are written into
+            # the leading latent slots (fuse_vae_embedding_in_latents_multiple), so
+            # the separate I2V-style `y` (mask + per-frame VAE latents, +20 ch) is
+            # redundant. Disable it so new_in_dim = latent + raymap (e.g. 16+384=400
+            # for the 14B). The 5B TI2V base already had require_vae_embedding=False.
+            require_vae_embedding=model.require_vae_embedding and not self.use_input_encoder,
             require_clip_embedding=model.require_clip_embedding,
             fuse_vae_embedding_in_latents=model.fuse_vae_embedding_in_latents,
             fuse_vae_embedding_in_latents_multiple = self.fuse_vae_embedding_in_latents_multiple,
             seperated_encoding=self.seperated_encoding,
             reverse_pred_order=self.reverse_pred_order,
+            use_input_encoder=self.use_input_encoder,
+            use_input_latent_mlp=self.use_input_latent_mlp,
+            per_layer_input_replacement=not self.input_prefix_attention,
+            input_prefix_attention=self.input_prefix_attention,
         )
+        if model.seperated_timestep != new_model.seperated_timestep:
+            print(f"seperated_timestep forced {model.seperated_timestep}->{new_model.seperated_timestep} "
+                  f"(per-token timestep for fused input latents)")
+        if model.require_vae_embedding != new_model.require_vae_embedding:
+            print(f"require_vae_embedding forced {model.require_vae_embedding}->{new_model.require_vae_embedding} "
+                  f"(input-encoder mode: no redundant I2V y; new_in_dim = latent + raymap)")
         
         # Load all pretrained weights EXCEPT layers with modified dimensions
         pretrained_state_dict = old_model.state_dict()
@@ -271,6 +351,57 @@ class WanTrainingModule(DiffusionTrainingModule):
                     param.requires_grad = True
                 print(f"Unfroze patch_embedding layer in dit2 for full training")
 
+    def unfreeze_input_encoder(self, pipe, trainable_input_vae):
+        """
+        Unfreeze the input-encoder modules created for per-layer cross-attention:
+          - `input_latent_mlp` (zero-init residual adaptor on the dit) is always trained.
+          - `input_vae` (separate VAE encoder copy) is trained only if requested.
+        Called after switch_pipe_to_training_mode, which freezes everything except LoRA.
+        """
+        for m in [getattr(pipe, "dit", None), getattr(pipe, "dit2", None)]:
+            if m is not None and getattr(m, "input_latent_mlp", None) is not None:
+                m.input_latent_mlp.train()
+                for p in m.input_latent_mlp.parameters():
+                    p.requires_grad = True
+                print("Unfroze input_latent_mlp for training")
+        if getattr(pipe, "input_vae", None) is not None:
+            if trainable_input_vae:
+                # Only the ENCODER path is exercised in the forward pass
+                # (VideoVAE(_38)_.encode uses self.encoder + self.conv1 only).
+                # The decoder / conv2 are never called, so unfreezing them would
+                # leave unused parameters and crash DDP (find_unused_parameters=False).
+                # Keep everything frozen first, then selectively unfreeze the encoder.
+                pipe.input_vae.eval()
+                for p in pipe.input_vae.parameters():
+                    p.requires_grad = False
+
+                enc_modules = []
+                vae_net = getattr(pipe.input_vae, "model", None)
+                if vae_net is not None:
+                    if getattr(vae_net, "encoder", None) is not None:
+                        enc_modules.append(("encoder", vae_net.encoder))
+                    if getattr(vae_net, "conv1", None) is not None:
+                        enc_modules.append(("conv1", vae_net.conv1))
+                if not enc_modules:
+                    raise RuntimeError(
+                        "trainable_input_vae=True but could not locate input_vae.model.encoder/conv1"
+                    )
+
+                n_params = 0
+                for _name, mod in enc_modules:
+                    mod.train()
+                    for p in mod.parameters():
+                        p.requires_grad = True
+                        n_params += p.numel()
+                print(f"input_vae ENCODER set to TRAINABLE "
+                      f"({', '.join(name for name, _ in enc_modules)}; "
+                      f"{n_params/1e6:.1f}M params); decoder/conv2 kept FROZEN")
+            else:
+                pipe.input_vae.eval()
+                for p in pipe.input_vae.parameters():
+                    p.requires_grad = False
+                print("input_vae kept FROZEN")
+
     def unfreeze_control_adapter(self, pipe, lora_base_model):
         """
         Unfreeze the control_adapter (SimpleAdapter) for training.
@@ -321,6 +452,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             "intrinsics": data.get("intrinsics", None) if need_camera_params else None,
             "use_prope": self.use_prope,
             "zero_temporal_rope": self.zero_temporal_rope,
+            "zero_xy_rope": self.zero_xy_rope,
+            "aat_frame_attention": self.aat_frame_attention,
             "height": data["input_images"][0].size[1],
             "width": data["input_images"][0].size[0],
             "num_frames": len(data["target_images"]),
@@ -397,6 +530,45 @@ def wan_parser():
                              "temporal frequencies with identity (1+0j). Spatial (height/width) "
                              "RoPE remains unchanged. This removes temporal position information "
                              "so the model treats all frames as having the same temporal position.")
+    parser.add_argument("--zero_xy_rope", default=False, action="store_true",
+                        help="Zero out the spatial (height/width) components of 3D RoPE by "
+                             "replacing H and W frequencies with identity (1+0j). Temporal RoPE "
+                             "remains unchanged. This removes spatial position information so "
+                             "all tokens within a frame share the same spatial position.")
+    parser.add_argument("--aat_frame_attention", default=False, action="store_true",
+                        help="Enable AAT-style alternating attention: even-indexed DiT blocks "
+                             "(0, 2, 4, ...) run within-frame self-attention with 2D xy RoPE "
+                             "only; odd-indexed blocks (1, 3, 5, ...) run full 3D global "
+                             "attention with NO RoPE (both frames and spatial positions are "
+                             "permutation-equivariant in the global pass). Self-contained: "
+                             "does not need --zero_temporal_rope or --zero_xy_rope, and is "
+                             "unaffected by them (those flags still control the legacy `freqs` "
+                             "consumed by VAP / vace). Reuses all pretrained weights.")
+    parser.add_argument("--use_input_encoder", default=False, action="store_true",
+                        help="Enable the separate input-frame encoder + true per-layer "
+                             "cross-attention (per-layer token replacement). The 6 input "
+                             "frames are encoded once (input_vae + zero-init MLP residual) "
+                             "into fixed, noise-free (timestep=0) tokens that are re-injected "
+                             "unchanged before every DiT block. Requires "
+                             "--fuse_vae_embedding_in_latents_multiple.")
+    parser.add_argument("--trainable_input_vae", default=False, action="store_true",
+                        help="Make the separate input_vae encoder trainable (advisor's "
+                             "'representation encoder' bet). If not set, only the zero-init "
+                             "MLP residual is trained (frozen VAE, advisor's literal proposal).")
+    parser.add_argument("--input_prefix_attention", default=False, action="store_true",
+                        help="Let the clean input-frame tokens transform through the DiT "
+                             "layers (NO per-layer token replacement), but mask self-attention "
+                             "so context tokens attend only to context and the target attends "
+                             "to everything. With per-token timestep (context=0) the context "
+                             "becomes a step-invariant prefix that can be encoded/transformed "
+                             "once at inference. Mutually exclusive with per-layer replacement.")
+    parser.add_argument("--no_input_latent_mlp", default=False, action="store_true",
+                        help="Drop the zero-init residual MLP on the input latents (use the "
+                             "frozen VAE latents directly). Used by the 14B frozen-VAE setup.")
+    parser.add_argument("--raymap_downsample_factor", type=int, default=8,
+                        help="PixelUnshuffle downscale factor for the Plucker raymap. Must "
+                             "match the VAE spatial compression: 8 for Wan2.1 (H/8, 384ch), "
+                             "16 for Wan2.2-TI2V-5B (H/16, 1536ch).")
     parser.add_argument("--num_dataset_samples", type=int, default=1000, help="Number of dataset samples to use for training.")
     parser.add_argument("--no_pixel_unshuffle", default=False, action="store_true",
                         help="Do not use pixel unshuffle to downscale the raymap to 1/8 resolution.")
@@ -441,6 +613,7 @@ if __name__ == "__main__":
         num_output_frames=args.num_output_frames,
         min_input_frames=args.min_input_frames,
         min_output_frames=args.min_output_frames,
+        raymap_downsample_factor=args.raymap_downsample_factor,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -472,6 +645,12 @@ if __name__ == "__main__":
         reverse_pred_order=args.reverse_pred_order,
         use_prope=args.use_prope,
         zero_temporal_rope=args.zero_temporal_rope,
+        zero_xy_rope=args.zero_xy_rope,
+        aat_frame_attention=args.aat_frame_attention,
+        use_input_encoder=args.use_input_encoder,
+        trainable_input_vae=args.trainable_input_vae,
+        use_input_latent_mlp=not args.no_input_latent_mlp,
+        input_prefix_attention=args.input_prefix_attention,
     )
     model_logger = ModelLogger(
         args.output_path,

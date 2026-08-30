@@ -1,8 +1,21 @@
+"""
+Wan2.2-TI2V-5B novel view synthesis inference (6-to-1) for the INPUT-ENCODER model.
+
+This matches the training config in
+  examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B_InputEncoder_6to1.sh
+i.e. the 6 conditioning frames are encoded by a SEPARATE VAE copy (+ zero-init MLP
+residual) and read via TRUE per-layer cross-attention (per-layer token replacement),
+with per-token timestep (context=0, target=t) and zero-temporal RoPE.
+
+Data / scene handling and metrics mirror test_wan2.1_6to1.py so it can be driven by a
+parallel launcher (see test_wan2.2_6to1_input_encoder_parallel.sh).
+"""
 import os
 import sys
 import time
 import json
 import glob
+import copy
 import argparse
 import random
 
@@ -29,8 +42,9 @@ from diffsynth.core.data.my_v2v_dataset_images_in_plucker_SE import (
 
 def modify_model_channels(pipe, model_attr, new_in_dim, device):
     """
-    Modify the model's input dimension to match training configuration.
-    Recreates the logic from train_SE.py.
+    Recreate the DiT with the training input dimension and the input-encoder
+    modules (zero-init residual MLP), matching train_SE.py's modify_model_channels
+    with --use_input_encoder --fuse_vae_embedding_in_latents_multiple --seperated_encoding.
     """
     model = getattr(pipe, model_attr)
     if model is None:
@@ -61,11 +75,13 @@ def modify_model_channels(pipe, model_attr, new_in_dim, device):
         require_vae_embedding=model.require_vae_embedding,
         require_clip_embedding=model.require_clip_embedding,
         fuse_vae_embedding_in_latents=model.fuse_vae_embedding_in_latents,
-        fuse_vae_embedding_in_latents_multiple=False,
+        fuse_vae_embedding_in_latents_multiple=True,
         seperated_encoding=True,
-     )
+        use_input_encoder=True,
+    )
 
-    # Copy pretrained weights on CPU (except patch_embedding which has different dims)
+    # Copy pretrained weights on CPU (except patch_embedding which has different dims,
+    # and input_latent_mlp which is new — both come from the checkpoint).
     pretrained_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     new_state_dict = new_model.state_dict()
 
@@ -88,32 +104,50 @@ def modify_model_channels(pipe, model_attr, new_in_dim, device):
     new_model = new_model.to(device=device, dtype=torch.bfloat16)
 
     setattr(pipe, model_attr, new_model)
-    print(f"Model {model_attr} channels modified successfully")
+    print(f"Model {model_attr} channels modified successfully (use_input_encoder=True)")
 
 
 def load_pipeline(args):
-    """Load pipeline, modify channels, and load checkpoint."""
+    """Load the Wan2.2-TI2V-5B pipeline, set up the input encoder, and load the checkpoint."""
+    # On 24GB GPUs the DiT (~11GB) + umt5-xxl text encoder (~11GB) don't co-fit.
+    # The text encoder is only needed once (empty prompt), so stream it from CPU
+    # (offload/onload on CPU, compute on CUDA) to free ~11GB for the DiT + VAEs.
+    # The DiT and VAE stay resident on CUDA for speed.
+    text_encoder_offload = {}
+    if not args.no_offload_text_encoder:
+        # Keep the text encoder on CPU (offload/onload/preparing all CPU) and only
+        # stream each submodule to CUDA transiently for computation. With vram_limit
+        # unset, a "cuda" preparing_device would persistently onload it (~11GB) and
+        # OOM alongside the resident DiT; "cpu" forces true per-module streaming.
+        text_encoder_offload = dict(
+            offload_dtype=torch.bfloat16, offload_device="cpu",
+            onload_dtype=torch.bfloat16, onload_device="cpu",
+            preparing_dtype=torch.bfloat16, preparing_device="cpu",
+            computation_dtype=torch.bfloat16, computation_device="cuda",
+        )
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device="cuda",
         model_configs=[
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-480P", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-480P", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-480P", origin_file_pattern="Wan2.1_VAE.pth"),
-            ModelConfig(model_id="Wan-AI/Wan2.1-I2V-14B-480P", origin_file_pattern="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", **text_encoder_offload),
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth"),
         ],
         tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
-        vram_limit=46,  # Enable VRAM management: offload models to CPU when not in use
     )
 
-    # Modify model input channels to match training configuration
+    # Recreate the DiT with the trained input dim + input-encoder modules.
     modify_model_channels(pipe, "dit", args.new_in_dim, "cuda")
+    pipe.dit.use_input_encoder = True
 
-    # Load checkpoint
+    # Separate VAE encoder for the 6 conditioning frames (copy of the main VAE).
+    pipe.input_vae = copy.deepcopy(pipe.vae)
+    print("Created separate input_vae (copy of vae) for input-frame conditioning")
+
+    # ── Load checkpoint ────────────────────────────────────────────────────
     print(f"Loading checkpoint from {args.checkpoint_path}")
     checkpoint = load_state_dict(args.checkpoint_path, torch_dtype=torch.bfloat16, device="cuda")
 
-    # Detect whether this is a LoRA checkpoint or a full checkpoint.
     has_lora_keys = any(
         "lora_A" in k or "lora_B" in k or "lora_up" in k or "lora_down" in k
         for k in checkpoint.keys()
@@ -122,23 +156,38 @@ def load_pipeline(args):
     if has_lora_keys:
         pipe.load_lora(pipe.dit, state_dict=checkpoint, alpha=1.0)
         print("LoRA weights loaded")
-
-        patch_emb_state = {k: v for k, v in checkpoint.items() if "patch_embedding" in k}
-        if patch_emb_state:
-            pipe.dit.load_state_dict(patch_emb_state, strict=False)
-            print(f"Loaded {len(patch_emb_state)} patch_embedding parameters")
-        else:
-            print("Warning: No patch_embedding weights found in checkpoint!")
     else:
-        load_result = pipe.dit.load_state_dict(checkpoint, strict=False)
-        missing = [k for k in load_result.missing_keys if k not in checkpoint]
-        unexpected = load_result.unexpected_keys
-        print(f"Full checkpoint loaded — {len(checkpoint)} keys")
-        if missing:
-            print(f"  Missing keys (not in ckpt): {missing[:10]}{'...' if len(missing) > 10 else ''}")
-        if unexpected:
-            print(f"  Unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+        # Full-DiT checkpoint: load the dit-prefixed weights directly.
+        dit_full = {k: v for k, v in checkpoint.items() if not k.startswith("pipe.input_vae.")}
+        load_result = pipe.dit.load_state_dict(dit_full, strict=False)
+        print(f"Full DiT checkpoint loaded — {len(dit_full)} keys; "
+              f"missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
 
+    # patch_embedding + input_latent_mlp are trained as full weights under pipe.dit.*
+    # (saved with the 'pipe.dit.' prefix stripped -> 'patch_embedding.*'/'input_latent_mlp.*').
+    dit_extra = {k: v for k, v in checkpoint.items()
+                 if k.startswith("patch_embedding") or k.startswith("input_latent_mlp")}
+    if dit_extra:
+        pipe.dit.load_state_dict(dit_extra, strict=False)
+        n_pe = sum(1 for k in dit_extra if k.startswith("patch_embedding"))
+        n_mlp = sum(1 for k in dit_extra if k.startswith("input_latent_mlp"))
+        print(f"Loaded {n_pe} patch_embedding + {n_mlp} input_latent_mlp parameters")
+    else:
+        print("Warning: no patch_embedding/input_latent_mlp weights found in checkpoint!")
+
+    # Trainable input_vae was saved under 'pipe.input_vae.*' (prefix not stripped).
+    ivae_state = {k[len("pipe.input_vae."):]: v for k, v in checkpoint.items()
+                  if k.startswith("pipe.input_vae.")}
+    if ivae_state:
+        load_result = pipe.input_vae.load_state_dict(ivae_state, strict=False)
+        print(f"Loaded {len(ivae_state)} input_vae parameters (trainable VAE) — "
+              f"missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
+    else:
+        print("No input_vae keys in checkpoint (frozen input VAE) — using the pretrained VAE copy")
+
+    pipe.input_vae = pipe.input_vae.to(device="cuda", dtype=torch.bfloat16)
+    pipe.dit.eval()
+    pipe.input_vae.eval()
     return pipe
 
 
@@ -147,40 +196,22 @@ def load_pipeline(args):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def scale_intrinsics(intrinsics, orig_height, orig_width, target_height, target_width):
-    """
-    Scale camera intrinsics from original resolution to target resolution.
-
-    Args:
-        intrinsics: (N, 3, 3) numpy array of intrinsic matrices
-        orig_height, orig_width: resolution the intrinsics correspond to
-        target_height, target_width: resolution to scale to
-
-    Returns:
-        (N, 3, 3) scaled intrinsic matrices
-    """
     scale_x = target_width / orig_width
     scale_y = target_height / orig_height
-
     scaled = intrinsics.copy()
-    scaled[:, 0, 0] *= scale_x   # fx
-    scaled[:, 0, 2] *= scale_x   # cx
-    scaled[:, 1, 1] *= scale_y   # fy
-    scaled[:, 1, 2] *= scale_y   # cy
+    scaled[:, 0, 0] *= scale_x
+    scaled[:, 0, 2] *= scale_x
+    scaled[:, 1, 1] *= scale_y
+    scaled[:, 1, 2] *= scale_y
     return scaled
 
 
 def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, height, width,
-                   no_pixel_unshuffle=False):
+                   no_pixel_unshuffle=False, downsample_factor=16):
     """
-    Normalize camera poses and compute plucker rays.
-    Follows the exact same logic as cog-nvs test and the training dataset.
-
+    Normalize camera poses and compute plucker rays at the Wan2.2 VAE /16 resolution.
     NOTE: intrinsics must already be scaled to (height, width) before calling.
-
-    Returns:
-        raymap: [N, C, H/8, W/8] plucker ray features
-        camera_poses_norm: [N, 4, 4] normalized c2w poses (last cam = identity)
-        intrinsics_tensor: [N, 3, 3] intrinsic matrices
+    Returns raymap [N, C, H/16, W/16], normalized c2w poses, and intrinsics tensor.
     """
     context_camera_poses = extrinsics[context_indices]
     target_camera_poses = extrinsics[target_indices]
@@ -199,13 +230,13 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
     # Normalize so last camera (target) is at origin
     _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
 
-    # Compute plucker rays → [N, C, H/8, W/8]
     raymap = get_plucker_rays(
         camera_poses_norm,
         intrinsics_tensor,
         height=height,
         width=width,
         no_pixel_unshuffle=no_pixel_unshuffle,
+        downsample_factor=downsample_factor,
     )
     if isinstance(raymap, np.ndarray):
         raymap = torch.from_numpy(raymap).float()
@@ -214,7 +245,6 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
 
 
 def center_crop(img, crop_size):
-    """Center crop an image to crop_size x crop_size."""
     h, w = img.shape[:2]
     start_h = (h - crop_size) // 2
     start_w = (w - crop_size) // 2
@@ -222,50 +252,31 @@ def center_crop(img, crop_size):
 
 
 def resize_and_center_crop(img, target_size=576):
-    """
-    Resize image so shorter side = target_size, then center crop to square.
-    """
     if isinstance(img, Image.Image):
         img = np.array(img)
-
     h, w = img.shape[:2]
-
     if h < w:
         new_h = target_size
         new_w = int(w * target_size / h)
     else:
         new_w = target_size
         new_h = int(h * target_size / w)
-
     img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return center_crop(img_resized, target_size)
 
 
 def resize_crop_to_rect(img, target_h, target_w):
-    """
-    Resize image so it covers (target_h, target_w), then center crop.
-
-    Returns:
-        cropped_img: np.ndarray (target_h, target_w, 3)
-        scale: float — uniform scale factor applied
-        crop_offset_x: int — horizontal crop offset (pixels in resized image)
-        crop_offset_y: int — vertical crop offset (pixels in resized image)
-    """
     if isinstance(img, Image.Image):
         img = np.array(img)
-
     h, w = img.shape[:2]
     scale = max(target_h / h, target_w / w)
     new_h = int(round(h * scale))
     new_w = int(round(w * scale))
-
     img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
     crop_offset_y = (new_h - target_h) // 2
     crop_offset_x = (new_w - target_w) // 2
     cropped = img_resized[crop_offset_y:crop_offset_y + target_h,
                           crop_offset_x:crop_offset_x + target_w]
-
     return cropped, scale, crop_offset_x, crop_offset_y
 
 
@@ -274,7 +285,6 @@ def resize_crop_to_rect(img, target_h, target_w):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_psnr(pred, gt):
-    """Compute PSNR between two uint8 numpy arrays."""
     mse = np.mean((pred.astype(float) - gt.astype(float)) ** 2)
     if mse == 0:
         return float("inf")
@@ -288,19 +298,11 @@ def compute_psnr(pred, gt):
 def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
                   dreamsim_model=None, dreamsim_preprocess=None,
                   ssim_fn=None, lpips_model=None):
-    """
-    Process a single DL3DV-10K scene: load data, run M-to-N NVS for each
-    batch of target frames, compute metrics, save results.
-
-    Returns:
-        dict with per-scene mean metrics, or None on failure.
-    """
     model_h = args.height
     model_w = args.width
     num_input = args.num_input_frames
     num_output = args.num_output_frames
 
-    # Paths
     scene_meta_path = os.path.join(args.dl3dv_meta_path, scene_hash)
     scene_data_path = os.path.join(args.dl3dv_data_path, scene_hash, "nerfstudio")
 
@@ -308,7 +310,6 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     print(f"[{scene_idx+1}/{total_scenes}] Processing scene: {scene_hash}")
     print(f"{'='*80}")
 
-    # ── Load train/test split ──────────────────────────────────────────
     split_file = os.path.join(scene_meta_path, f"train_test_split_{num_input}.json")
     if not os.path.exists(split_file):
         print(f"  Warning: {split_file} not found. Skipping.")
@@ -317,14 +318,13 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     with open(split_file, 'r') as f:
         split_data = json.load(f)
 
-    train_ids = split_data['train_ids']   # M context frames
-    test_ids = split_data['test_ids']     # target frames
+    train_ids = split_data['train_ids']
+    test_ids = split_data['test_ids']
 
     print(f"  Context frame IDs ({num_input}): {train_ids}")
     print(f"  Target frame IDs ({len(test_ids)} frames): {test_ids[:5]}{'...' if len(test_ids)>5 else ''}")
     print(f"  Generation mode: {num_input}-to-{num_output}")
 
-    # ── Load transforms.json ───────────────────────────────────────────
     transforms_file = os.path.join(scene_data_path, "transforms.json")
     if not os.path.exists(transforms_file):
         print(f"  Warning: {transforms_file} not found. Skipping.")
@@ -333,19 +333,13 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     with open(transforms_file, 'r') as f:
         transforms_data = json.load(f)
 
-    # Original resolution from transforms.json (4K)
     orig_w = transforms_data['w']
     orig_h = transforms_data['h']
-
-    # Actual image resolution (960p)
     actual_w = 960
     actual_h = 540
-
-    # Scale factors for intrinsics: 4K -> 960p
     scale_w_960 = actual_w / orig_w
     scale_h_960 = actual_h / orig_h
 
-    # Extract intrinsics and scale to 960p
     orig_intrinsic = np.array([
         [transforms_data['fl_x'], 0, transforms_data['cx']],
         [0, transforms_data['fl_y'], transforms_data['cy']],
@@ -358,10 +352,8 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
     scaled_intrinsic_960p[0, 2] *= scale_w_960
     scaled_intrinsic_960p[1, 2] *= scale_h_960
 
-    # Further scale intrinsics to model input resolution
     input_mode = args.input_mode
     if input_mode == "crop":
-        # Resize uniformly to cover model_h x model_w, then center crop
         crop_scale = max(model_h / actual_h, model_w / actual_w)
         resized_h = int(round(actual_h * crop_scale))
         resized_w = int(round(actual_w * crop_scale))
@@ -369,34 +361,26 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         crop_offset_y = (resized_h - model_h) / 2.0
 
         scaled_intrinsic_model = scaled_intrinsic_960p.copy()
-        # Apply uniform resize scale
-        scaled_intrinsic_model[0, 0] *= crop_scale   # fx
-        scaled_intrinsic_model[1, 1] *= crop_scale   # fy
-        scaled_intrinsic_model[0, 2] *= crop_scale   # cx
-        scaled_intrinsic_model[1, 2] *= crop_scale   # cy
-        # Adjust principal point for center crop offset
-        scaled_intrinsic_model[0, 2] -= crop_offset_x  # cx
-        scaled_intrinsic_model[1, 2] -= crop_offset_y  # cy
-
+        scaled_intrinsic_model[0, 0] *= crop_scale
+        scaled_intrinsic_model[1, 1] *= crop_scale
+        scaled_intrinsic_model[0, 2] *= crop_scale
+        scaled_intrinsic_model[1, 2] *= crop_scale
+        scaled_intrinsic_model[0, 2] -= crop_offset_x
+        scaled_intrinsic_model[1, 2] -= crop_offset_y
         print(f"  Input mode: crop (scale={crop_scale:.4f}, crop_offset=({crop_offset_x},{crop_offset_y}))")
     else:
-        # Stretch to model resolution (default)
         model_scale_w = model_w / actual_w
         model_scale_h = model_h / actual_h
-
         scaled_intrinsic_model = scaled_intrinsic_960p.copy()
         scaled_intrinsic_model[0, 0] *= model_scale_w
         scaled_intrinsic_model[1, 1] *= model_scale_h
         scaled_intrinsic_model[0, 2] *= model_scale_w
         scaled_intrinsic_model[1, 2] *= model_scale_h
-
         print(f"  Input mode: stretch")
 
     print(f"  Original res: {orig_w}x{orig_h}, actual 960p: {actual_w}x{actual_h}, model: {model_w}x{model_h}")
 
-    # ── Load frames data ───────────────────────────────────────────────
     frames_data = transforms_data['frames']
-    images_dir = os.path.join(scene_data_path, "images_4")
 
     all_indices = train_ids + test_ids
     all_images_960p = {}
@@ -407,41 +391,31 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         frame_data = frames_data[idx]
         file_path = frame_data['file_path'].replace('images/', 'images_4/')
         img_path = os.path.join(scene_data_path, file_path)
-
         if not os.path.exists(img_path):
             print(f"  Warning: Image {img_path} not found. Skipping scene.")
             return None
-
         img_960p = np.array(Image.open(img_path).convert('RGB'))
         all_images_960p[idx] = img_960p
-
         if input_mode == "crop":
             img_model, _, _, _ = resize_crop_to_rect(img_960p, model_h, model_w)
         else:
             img_model = cv2.resize(img_960p, (model_w, model_h), interpolation=cv2.INTER_AREA)
         all_images_model[idx] = img_model
-
         c2w = np.array(frame_data['transform_matrix'], dtype=np.float32)
         all_extrinsics[idx] = c2w
 
-    # ── Setup output directory ─────────────────────────────────────────
     output_dir = os.path.join(args.output_path, scene_hash)
     os.makedirs(output_dir, exist_ok=True)
 
     eval_size = args.eval_size
 
-    # ── Process target frames in batches of num_output ──────────────────
     psnrs = []
     ssims = []
     lpips_scores = []
     dreamsim_scores = []
-
-    # Per-view inference timing (excludes ckpt loading and input loading;
-    # measures only the pipe() forward pass with CUDA synchronization).
     scene_inference_time_s = 0.0
     scene_views = 0
 
-    # Batch test_ids into groups of num_output
     target_batches = [test_ids[i:i+num_output] for i in range(0, len(test_ids), num_output)]
     total_batches = len(target_batches)
 
@@ -449,30 +423,26 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         batch_str = ",".join(str(t) for t in target_batch)
         print(f"\n  [batch {batch_pos+1}/{total_batches}] Generating target frame_idx={batch_str}...")
 
-        # M context + N target (N may be < num_output for the last batch)
         cur_num_output = len(target_batch)
         current_indices = train_ids + target_batch
         context_indices = list(range(num_input))
         target_indices = list(range(num_input, num_input + cur_num_output))
         num_total = num_input + cur_num_output
 
-        # Prepare context images at model resolution (PIL)
         context_images = [Image.fromarray(all_images_model[idx]) for idx in train_ids]
 
-        # Prepare extrinsics and intrinsics arrays
         current_extrinsics = np.stack([all_extrinsics[idx] for idx in current_indices], axis=0)
         current_intrinsics = np.stack([scaled_intrinsic_model] * num_total, axis=0)
 
-        # Compute plucker raymap and normalized camera params
         raymap, camera_poses_norm, intrinsics_tensor = prepare_raymap(
             current_extrinsics, current_intrinsics,
             context_indices, target_indices,
             model_h, model_w,
             no_pixel_unshuffle=args.no_pixel_unshuffle,
+            downsample_factor=args.raymap_downsample_factor,
         )
         raymap = raymap.to("cuda", dtype=torch.bfloat16)
 
-        # Run inference
         pipe_kwargs = dict(
             prompt="",
             negative_prompt="",
@@ -489,19 +459,10 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             tiled=True,
         )
 
-        if args.use_prope:
-            pipe_kwargs["use_prope"] = True
-            pipe_kwargs["camera_poses_norm"] = camera_poses_norm.to("cuda", dtype=torch.bfloat16)
-            pipe_kwargs["intrinsics"] = intrinsics_tensor.to("cuda", dtype=torch.bfloat16)
-
         if args.zero_temporal_rope:
             pipe_kwargs["zero_temporal_rope"] = True
-
         if args.zero_xy_rope:
             pipe_kwargs["zero_xy_rope"] = True
-
-        if args.aat_frame_attention:
-            pipe_kwargs["aat_frame_attention"] = True
 
         if args.time_inference:
             torch.cuda.synchronize()
@@ -517,7 +478,6 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             print(f"    Inference: {_t_inf:.2f}s "
                   f"({_t_inf / cur_num_output:.2f}s/view, {cur_num_output} view(s))")
 
-        # Extract generated target frames (last cur_num_output frames)
         for out_i in range(cur_num_output):
             target_frame_idx = target_batch[out_i]
             pred_pil = video[num_input + out_i]
@@ -602,7 +562,6 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             comp_path = os.path.join(output_dir, f"comparison_frame_{target_frame_idx:04d}.png")
             Image.fromarray(comparison).save(comp_path)
 
-    # ── Scene summary ──────────────────────────────────────────────────
     scene_metrics = {}
     scene_metrics['psnr'] = np.mean(psnrs) if psnrs else 0
     scene_metrics['ssim'] = np.mean(ssims) if ssims else 0
@@ -622,16 +581,11 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
         print(f"    Mean LPIPS:    {scene_metrics['lpips']:.4f}")
     if dreamsim_scores:
         print(f"    Mean DreamSim: {scene_metrics['dreamsim']:.4f}")
-    if args.time_inference and scene_views > 0:
-        print(f"    Inference:     {scene_inference_time_s:.1f}s total, "
-              f"{scene_metrics['inference_time_per_view_s']:.2f}s/view "
-              f"({scene_views} view(s))")
 
-    # Save per-scene metrics
     metrics_file = os.path.join(output_dir, "metrics.txt")
     with open(metrics_file, 'w') as f:
         f.write(f"Scene: {scene_hash}\n")
-        f.write(f"Method: {num_input}-to-{num_output} generation ({num_input} context frames + {num_output} target frames)\n")
+        f.write(f"Method: {num_input}-to-{num_output} generation (input-encoder / per-layer cross-attn)\n")
         f.write(f"Model resolution: {model_h}x{model_w}\n")
         f.write(f"Evaluation resolution: {eval_size}x{eval_size} (center crop)\n\n")
         f.write(f"Mean PSNR: {scene_metrics['psnr']:.2f} dB\n")
@@ -641,11 +595,6 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             f.write(f"Mean LPIPS: {scene_metrics['lpips']:.4f}\n")
         if dreamsim_scores:
             f.write(f"Mean DreamSim: {scene_metrics['dreamsim']:.4f}\n")
-        if args.time_inference and scene_views > 0:
-            f.write(f"Inference time per view: "
-                    f"{scene_metrics['inference_time_per_view_s']:.2f} s "
-                    f"(total {scene_inference_time_s:.1f} s over "
-                    f"{scene_views} view(s); excludes ckpt and input loading)\n")
         f.write(f"\nPer-frame metrics:\n")
         for i, target_idx in enumerate(test_ids):
             line = f"Frame {target_idx}: PSNR={psnrs[i]:.2f} dB"
@@ -658,7 +607,6 @@ def process_scene(pipe, args, scene_hash, scene_idx, total_scenes,
             f.write(line + "\n")
 
     print(f"  Metrics saved to {metrics_file}")
-
     return scene_metrics
 
 
@@ -675,10 +623,8 @@ def main(args):
     print(f"Generation mode: {args.num_input_frames}-to-{args.num_output_frames}")
     print(f"Number of scenes: {len(args.scenes)}")
 
-    # ── Load pipeline ─────────────────────────────────────────────────────
     pipe = load_pipeline(args)
 
-    # ── Optional metrics models ────────────────────────────────────────────
     dreamsim_model = None
     dreamsim_preprocess = None
     if args.use_dreamsim:
@@ -704,15 +650,12 @@ def main(args):
         except ImportError:
             print("Warning: lpips not available, skipping LPIPS metric")
 
-    # ── Process scenes sequentially ────────────────────────────────────────
     os.makedirs(args.output_path, exist_ok=True)
 
     all_psnr = []
     all_ssim = []
     all_lpips = []
     all_dreamsim = []
-    all_inference_time_s = 0.0
-    all_inference_views = 0
 
     for scene_idx, scene_hash in enumerate(args.scenes):
         result = process_scene(
@@ -722,7 +665,6 @@ def main(args):
             ssim_fn=ssim_fn,
             lpips_model=lpips_model,
         )
-
         if result is not None:
             all_psnr.append(result['psnr'])
             if result['ssim'] > 0:
@@ -731,14 +673,10 @@ def main(args):
                 all_lpips.append(result['lpips'])
             if result['dreamsim'] > 0:
                 all_dreamsim.append(result['dreamsim'])
-            all_inference_time_s += result.get('inference_time_total_s', 0.0)
-            all_inference_views += result.get('inference_views', 0)
 
-    # ── Overall summary ────────────────────────────────────────────────────
     print(f"\n{'='*80}")
     print(f"OVERALL RESULTS ({len(all_psnr)} scenes)")
     print(f"{'='*80}")
-
     if all_psnr:
         print(f"  Mean PSNR:     {np.mean(all_psnr):.2f} ± {np.std(all_psnr):.2f} dB")
     if all_ssim:
@@ -747,13 +685,8 @@ def main(args):
         print(f"  Mean LPIPS:    {np.mean(all_lpips):.4f} ± {np.std(all_lpips):.4f}")
     if all_dreamsim:
         print(f"  Mean DreamSim: {np.mean(all_dreamsim):.4f} ± {np.std(all_dreamsim):.4f}")
-    if args.time_inference and all_inference_views > 0:
-        print(f"  Inference:     {all_inference_time_s:.1f}s total, "
-              f"{all_inference_time_s / all_inference_views:.2f}s/view "
-              f"({all_inference_views} view(s); excludes ckpt and input loading)")
     print(f"{'='*80}")
 
-    # Save aggregate results
     summary_file = os.path.join(args.output_path, "summary.txt")
     with open(summary_file, 'w') as f:
         f.write(f"Overall Results ({len(all_psnr)} scenes)\n")
@@ -765,11 +698,6 @@ def main(args):
             f.write(f"Mean LPIPS: {np.mean(all_lpips):.4f} ± {np.std(all_lpips):.4f}\n")
         if all_dreamsim:
             f.write(f"Mean DreamSim: {np.mean(all_dreamsim):.4f} ± {np.std(all_dreamsim):.4f}\n")
-        if args.time_inference and all_inference_views > 0:
-            f.write(f"Inference time per view: "
-                    f"{all_inference_time_s / all_inference_views:.2f} s "
-                    f"(total {all_inference_time_s:.1f} s over "
-                    f"{all_inference_views} view(s); excludes ckpt and input loading)\n")
         f.write(f"\nPer-scene results:\n")
         for i, scene_hash in enumerate(args.scenes):
             if i < len(all_psnr):
@@ -790,13 +718,13 @@ def main(args):
 if __name__ == "__main__":
     start_time = time.time()
 
-    parser = argparse.ArgumentParser(description="Wan2.1 M-to-N NVS evaluation on DL3DV-10K scenes")
+    parser = argparse.ArgumentParser(description="Wan2.2-TI2V-5B input-encoder 6-to-1 NVS evaluation on DL3DV-10K")
 
     # Model
     parser.add_argument("--checkpoint_path", type=str, required=True,
                         help="Path to the trained checkpoint (.safetensors)")
-    parser.add_argument("--new_in_dim", type=int, default=420,
-                        help="New input dimension for the modified model (must match training --new_in_dim)")
+    parser.add_argument("--new_in_dim", type=int, default=1584,
+                        help="Input dim of the modified model (48 latent + 1536 raymap = 1584 for the 5B).")
     parser.add_argument("--num_input_frames", type=int, default=6,
                         help="Number of input (context) frames M. Default: 6.")
     parser.add_argument("--num_output_frames", type=int, default=1,
@@ -815,36 +743,28 @@ if __name__ == "__main__":
                         help="Scene hashes to process")
 
     # Resolution
-    parser.add_argument("--height", type=int, default=192, help="Model input height (training resolution)")
-    parser.add_argument("--width", type=int, default=336, help="Model input width (training resolution)")
-    parser.add_argument("--eval_size", type=int, default=576,
-                        help="Evaluation size for center-crop metrics (default: 576)")
+    parser.add_argument("--height", type=int, default=480, help="Model input height (training resolution)")
+    parser.add_argument("--width", type=int, default=832, help="Model input width (training resolution)")
+    parser.add_argument("--eval_size", type=int, default=480,
+                        help="Evaluation size for center-crop metrics (default: 480)")
     parser.add_argument("--input_mode", type=str, default="crop", choices=["stretch", "crop"],
-                        help="How to fit images to model resolution: "
-                             "'stretch' distorts to exact (h,w); "
-                             "'crop' resizes to cover then center-crops (preserves aspect ratio). "
-                             "Intrinsics are adjusted accordingly.")
+                        help="How to fit images to model resolution: 'stretch' or 'crop' (preserves aspect ratio).")
+
+    # Raymap / RoPE (must match training)
+    parser.add_argument("--raymap_downsample_factor", type=int, default=16,
+                        help="PixelUnshuffle downscale for raymaps (16 for Wan2.2-TI2V-5B -> 1536 ch).")
+    parser.add_argument("--zero_temporal_rope", action="store_true", default=False,
+                        help="Zero out temporal RoPE. Must match training --zero_temporal_rope.")
+    parser.add_argument("--zero_xy_rope", action="store_true", default=False,
+                        help="Zero out spatial (H/W) RoPE. Must match training --zero_xy_rope.")
+    parser.add_argument("--no_pixel_unshuffle", action="store_true", default=False,
+                        help="Use bilinear downsampling instead of PixelUnshuffle for raymaps.")
 
     # Inference settings
     parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--use_prope", action="store_true", default=False,
-                        help="Enable PRoPE (Projective Positional Encoding) in attention. "
-                             "Requires checkpoint trained with --use_prope.")
-    parser.add_argument("--zero_temporal_rope", action="store_true", default=False,
-                        help="Zero out temporal RoPE (identity rotation for frame axis). "
-                             "Requires checkpoint trained with --zero_temporal_rope.")
-    parser.add_argument("--zero_xy_rope", action="store_true", default=False,
-                        help="Zero out spatial (H/W) RoPE (identity rotation for spatial axes). "
-                             "Requires checkpoint trained with --zero_xy_rope.")
-    parser.add_argument("--aat_frame_attention", action="store_true", default=False,
-                        help="Enable AAT-style alternating attention: even-indexed DiT blocks "
-                             "(0, 2, 4, ...) run within-frame self-attention with 2D xy RoPE only; "
-                             "odd-indexed blocks (1, 3, 5, ...) run full 3D global attention with "
-                             "NO RoPE. Self-contained: unaffected by --zero_temporal_rope / "
-                             "--zero_xy_rope. Must match the training --aat_frame_attention flag.")
-    parser.add_argument("--no_pixel_unshuffle", action="store_true", default=False,
-                        help="Use bilinear downsampling instead of PixelUnshuffle for raymaps. "
-                             "Must match the training --no_pixel_unshuffle flag.")
+    parser.add_argument("--no_offload_text_encoder", action="store_true",
+                        help="Keep the text encoder resident on GPU (default: stream it from "
+                             "CPU to fit the 5B DiT + text encoder on 24GB GPUs).")
 
     # Metrics
     parser.add_argument("--use_dreamsim", action="store_true", help="Compute DreamSim metric")
@@ -853,8 +773,7 @@ if __name__ == "__main__":
 
     # Timing
     parser.add_argument("--time_inference", action="store_true",
-                        help="Measure per-view inference time (pipe forward only, "
-                             "with cuda.synchronize). Excludes ckpt loading and input loading.")
+                        help="Measure per-view inference time (pipe forward only, with cuda.synchronize).")
 
     args = parser.parse_args()
     main(args)
@@ -862,4 +781,3 @@ if __name__ == "__main__":
     elapsed = time.time() - start_time
     print(f"\nTotal time: {elapsed / 60.0:.1f} minutes")
     print(f"Max GPU memory: {torch.cuda.max_memory_allocated() / 1024**2:.0f} MB")
-

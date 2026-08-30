@@ -370,7 +370,8 @@ def process_scene(pipe, args, scene_name, scene_idx, total_scenes,
     print(f"{'='*80}")
 
     # ── Load train/test split ────────────────────────────────────────────
-    split_file = os.path.join(scene_split_path, "train_test_split_6.json")
+    num_input = args.num_input_frames
+    split_file = os.path.join(scene_split_path, f"train_test_split_{num_input}.json")
     if not os.path.exists(split_file):
         print(f"  Warning: {split_file} not found. Skipping.")
         return None
@@ -744,6 +745,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--new_in_dim", type=int, default=420)
+    parser.add_argument("--num_input_frames", type=int, default=6,
+                        help="Number of input (context) frames. Loads train_test_split_{N}.json.")
 
     parser.add_argument("--mip360_data_path", type=str, default="/data2/qiwu2/mip360",
                         help="Path to mip-NeRF 360 data (contains scene dirs with images/ and sparse/)")

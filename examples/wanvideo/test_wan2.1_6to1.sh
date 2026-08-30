@@ -9,7 +9,7 @@ MODE="${1:-zero_temporal_rope}"
 
 # ── M-to-N configuration ──────────────────────────────────────────────────────
 NUM_INPUT_FRAMES="${2:-6}"
-NUM_OUTPUT_FRAMES="${3:-2}"
+NUM_OUTPUT_FRAMES="${3:-1}"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 if [ "$MODE" = "prope" ]; then
@@ -18,16 +18,19 @@ if [ "$MODE" = "prope" ]; then
     EXTRA_ARGS="--use_prope"
 elif [ "$MODE" = "zero_temporal_rope" ]; then
     # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope_2/epoch-79.safetensors"
-    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-zero-temporal-rope_2-T10_2/epoch-79.safetensors"
-    output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope_2-T10_2_79"
+    # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_spatialvid1k/epoch-239.safetensors"
+    # output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_spatialvid1k_239"
+    # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
+    checkpoint_path="/data2/qiwu2/epoch-159.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_test"
     EXTRA_ARGS="--zero_temporal_rope"
 else
     # checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_curriculum/epoch-79.safetensors"
-    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context/epoch-79.safetensors"
-    output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_sorted_context"
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context_test_new_2/epoch-11.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_sorted_context_new_2"
     EXTRA_ARGS=""
 fi
-GPU_ID=7
+GPU_ID=1
 
 # All 10 DL3DV-10K test scenes
 SCENES=(
@@ -71,6 +74,8 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python test_wan2.1_6to1.py \
     --input_mode "crop" \
     --height 192 \
     --width 336 \
+    --time_inference \
+    --num_inference_steps 50 \
     $EXTRA_ARGS
 echo ""
 echo "Done!"

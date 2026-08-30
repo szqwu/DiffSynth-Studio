@@ -6,9 +6,9 @@
 cd /data2/qiwu2/DiffSynth-Studio/examples/wanvideo
 
 # --- Wait for current training to finish ---
-if pgrep -f "train_SE.py" > /dev/null 2>&1; then
+if pgrep -f "train_SE_T2V_1_3B.py" > /dev/null 2>&1; then
     echo "$(date): Waiting for current train_SE.py job to finish..."
-    while pgrep -f "train_SE.py" > /dev/null 2>&1; do
+    while pgrep -f "train_SE_T2V_1_3B.py" > /dev/null 2>&1; do
         sleep 60
     done
     echo "$(date): Current job finished. Waiting 30s for GPU cleanup..."
@@ -24,7 +24,7 @@ echo "============================================"
 
 # /data2/qiwu2/vnice.sh bash model_training/lora/Wan2.1-SE-ZeroTemporalRoPE-14B.sh
 # bash model_training/lora/Wan2.1-SE-ZeroTemporalRoPE-14B.sh
-bash model_training/lora/Wan2.1-SE-14B.sh
+bash model_training/lora/Wan2.1-SE-ZeroTemporalRoPE-T2V-1.3B.sh
 
 if [ $? -eq 0 ]; then
     echo "============================================"

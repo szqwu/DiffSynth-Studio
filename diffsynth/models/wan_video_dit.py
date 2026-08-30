@@ -25,12 +25,17 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
     
     
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attn_mask=None):
+    # An explicit attention mask (e.g. the input-encoder "prefix" mask) is only
+    # supported by the SDPA path; FA2/FA3/Sage take no arbitrary mask, so force
+    # the compatibility (SDPA) branch whenever a mask is provided.
+    if attn_mask is not None:
+        compatibility_mode = True
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     elif FLASH_ATTN_3_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
@@ -117,8 +122,8 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         
-    def forward(self, q, k, v):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
+    def forward(self, q, k, v, attn_mask=None):
+        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, attn_mask=attn_mask)
         return x
 
 
@@ -138,10 +143,57 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, prope_attn=None):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+    def forward(self, x, freqs, axis="global", fhw=None, prope_attn=None, attn_mask=None,
+                ctx_cache=None, cache_key=None, n_in=None, cache_mode=None):
+        if axis == "frame":
+            if fhw is None:
+                raise ValueError("axis='frame' requires fhw=(f, h, w) to reshape tokens.")
+            if prope_attn is not None:
+                raise NotImplementedError(
+                    "PRoPE is not supported with axis='frame'. PRoPE expects the joint (B, num_heads, S, head_dim) layout."
+                )
+            if attn_mask is not None:
+                raise NotImplementedError(
+                    "attn_mask is not supported with axis='frame' (tokens are reshaped per-frame)."
+                )
+            f, _h, _w = fhw
+            # Reshape (B, f*h*w, C) -> (B*f, h*w, C) so each frame attends only to itself
+            x_in = rearrange(x, "b (f n) c -> (b f) n c", f=f)
+        else:
+            x_in = x
+
+        # Transform-once context K/V cache (only used at inference with the prefix
+        # attention mask; global axis, no PRoPE). Because the context tokens never
+        # attend to the target and use a fixed t=0, their per-layer K/V are identical
+        # across all denoising steps -> compute once ("write") and reuse ("read").
+        if cache_mode is not None:
+            if axis != "global" or prope_attn is not None:
+                raise NotImplementedError("context K/V cache only supports global axis without PRoPE.")
+            q = self.norm_q(self.q(x_in))
+            k = self.norm_k(self.k(x_in))
+            v = self.v(x_in)
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+            if cache_mode == "write":
+                # freqs spans the full sequence; stash the (post-RoPE) context K/V.
+                ctx_cache[("k", cache_key)] = k[:, :n_in].detach()
+                ctx_cache[("v", cache_key)] = v[:, :n_in].detach()
+                out = self.attn(q, k, v, attn_mask=attn_mask)
+            elif cache_mode == "read":
+                # x/freqs here are TARGET-only; prepend the cached context K/V so the
+                # target attends to [context ; target] (no mask needed).
+                ck = ctx_cache[("k", cache_key)]
+                cv = ctx_cache[("v", cache_key)]
+                k = torch.cat([ck, k], dim=1)
+                v = torch.cat([cv, v], dim=1)
+                out = self.attn(q, k, v, attn_mask=None)
+            else:
+                raise ValueError(f"unknown cache_mode {cache_mode!r}")
+            return self.o(out)
+
+        q = self.norm_q(self.q(x_in))
+        k = self.norm_k(self.k(x_in))
+        v = self.v(x_in)
         if prope_attn is not None:
             # PRoPE path: camera-geometry-aware positional encoding
             # Reshape to (B, num_heads, S, head_dim) for PRoPE
@@ -156,15 +208,20 @@ class SelfAttention(nn.Module):
             # Normalize Q and K to restore the expected scale for dot-product attention.
             q = F.normalize(q, dim=-1) * (q.shape[-1] ** 0.5)
             k = F.normalize(k, dim=-1) * (k.shape[-1] ** 0.5)
-            x = F.scaled_dot_product_attention(q, k, v)
-            x = prope_attn._apply_to_o(x)
-            x = rearrange(x, "b n s d -> b s (n d)")
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            out = prope_attn._apply_to_o(out)
+            out = rearrange(out, "b n s d -> b s (n d)")
         else:
-            # Original path: 3D grid RoPE
+            # Original path: 3D grid RoPE (also used for axis='frame' with 2D-only RoPE supplied via freqs)
             q = rope_apply(q, freqs, self.num_heads)
             k = rope_apply(k, freqs, self.num_heads)
-            x = self.attn(q, k, v)
-        return self.o(x)
+            out = self.attn(q, k, v, attn_mask=attn_mask)
+        out = self.o(out)
+
+        if axis == "frame":
+            f, _h, _w = fhw
+            out = rearrange(out, "(b f) n c -> b (f n) c", f=f)
+        return out
 
 
 class CrossAttention(nn.Module):
@@ -231,7 +288,8 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, prope_attn=None):
+    def forward(self, x, context, t_mod, freqs, axis="global", fhw=None, prope_attn=None, attn_mask=None,
+                ctx_cache=None, cache_key=None, n_in=None, cache_mode=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -243,7 +301,9 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, prope_attn=prope_attn))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, axis=axis, fhw=fhw, prope_attn=prope_attn,
+                                                  attn_mask=attn_mask, ctx_cache=ctx_cache, cache_key=cache_key,
+                                                  n_in=n_in, cache_mode=cache_mode))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -268,6 +328,31 @@ class MLP(torch.nn.Module):
         if self.has_pos_emb:
             x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
         return self.proj(x)
+
+
+class InputLatentResidualMLP(nn.Module):
+    """Zero-init residual adaptor applied to the clean input-frame VAE latents.
+
+    Returns ``z + MLP(z)``. The second linear layer is zero-initialized so the
+    module starts as an exact identity (``z``) and only learns to add "visual
+    juice" to the conditioning representation as training progresses.
+    Operates on channel-first latents of shape ``(B, C, T, H, W)``.
+    """
+    def __init__(self, dim: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or dim * 4
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU(approximate='tanh')
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor):
+        x_perm = x.movedim(1, -1)  # (B, C, T, H, W) -> (B, T, H, W, C)
+        residual = self.fc2(self.act(self.fc1(self.norm(x_perm))))
+        out = x_perm + residual
+        return out.movedim(-1, 1)  # back to (B, C, T, H, W)
 
 
 class Head(nn.Module):
@@ -314,6 +399,10 @@ class WanModel(torch.nn.Module):
         fuse_vae_embedding_in_latents_multiple: bool = False,
         seperated_encoding: bool = False,
         reverse_pred_order: bool = False,
+        use_input_encoder: bool = False,
+        use_input_latent_mlp: bool = True,
+        per_layer_input_replacement: bool = True,
+        input_prefix_attention: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -332,8 +421,27 @@ class WanModel(torch.nn.Module):
         self.fuse_vae_embedding_in_latents_multiple = fuse_vae_embedding_in_latents_multiple
         self.seperated_encoding = seperated_encoding
         self.reverse_pred_order = reverse_pred_order
+        self.use_input_encoder = use_input_encoder
+        # Input-conditioning behavior flags:
+        #   per_layer_input_replacement: re-inject the fixed clean input-frame tokens
+        #     before every DiT block (true per-layer cross-attention; the inputs are
+        #     never transformed). Default True for back-compat with the 5B run.
+        #   input_prefix_attention: instead of replacing, let the input tokens
+        #     transform through the layers but mask attention so context tokens
+        #     attend only to each other (a clean, step-invariant prefix). Mutually
+        #     exclusive in spirit with per_layer_input_replacement.
+        self.per_layer_input_replacement = per_layer_input_replacement
+        self.input_prefix_attention = input_prefix_attention
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        # Zero-init residual adaptor for the clean input-frame conditioning latents.
+        # Applied (as z + MLP(z)) to the VAE latents of the input frames before
+        # patch embedding, so the conditioning encoder can extract extra "visual
+        # juice" once, before iterative denoising (true per-layer cross-attention).
+        if use_input_encoder and use_input_latent_mlp:
+            self.input_latent_mlp = InputLatentResidualMLP(out_dim)
+        else:
+            self.input_latent_mlp = None
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim),
             nn.GELU(approximate='tanh'),
@@ -405,6 +513,7 @@ class WanModel(torch.nn.Module):
                 Ks: Optional[torch.Tensor] = None,
                 image_hw: Optional[Tuple[int, int]] = None,
                 zero_temporal_rope: bool = False,
+                zero_xy_rope: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -420,12 +529,17 @@ class WanModel(torch.nn.Module):
         x, (f, h, w) = self.patchify(x)
         
         f_freqs = self.freqs[0][:f]
+        h_freqs = self.freqs[1][:h]
+        w_freqs = self.freqs[2][:w]
         if zero_temporal_rope:
             f_freqs = torch.ones_like(f_freqs)
+        if zero_xy_rope:
+            h_freqs = torch.ones_like(h_freqs)
+            w_freqs = torch.ones_like(w_freqs)
         freqs = torch.cat([
             f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            h_freqs.view(1, h, 1, -1).expand(f, h, w, -1),
+            w_freqs.view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
         
         # Prepare PRoPE if camera parameters are provided

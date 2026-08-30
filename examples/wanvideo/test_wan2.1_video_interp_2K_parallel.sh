@@ -11,17 +11,17 @@ MODE="${1:-short}"
 # ── Configuration ──────────────────────────────────────────────────────────────
 checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
 data_path="/data2/qiwu2/2K"
-GPU_IDS=( 2 3 4 5 6 )
-SCENES_PER_GPU=4
+GPU_IDS=( 1 2 3 4 5 6 7 )
+SCENES_PER_GPU=2
 
 if [ "$MODE" = "long" ]; then
     KEYFRAME_GAP=16
     TOTAL_FRAMES=81
-    output_path="/data2/qiwu2/dl3dv2K_video_interp_81f_zero-temporal-rope-480p_epoch-59"
+    output_path="/data2/qiwu2/dl3dv2K_2_video_interp_81f_zero-temporal-rope-480p_epoch-59"
 else
     KEYFRAME_GAP=8
     TOTAL_FRAMES=41
-    output_path="/data2/qiwu2/dl3dv2K_video_interp_41f_zero-temporal-rope-480p_epoch-59"
+    output_path="/data2/qiwu2/dl3dv2K_2_video_interp_41f_zero-temporal-rope-480p_epoch-59"
 fi
 
 # 20 random scenes from /data2/qiwu2/2K (seed=123, 1000 total)
@@ -57,6 +57,13 @@ SCENES=(
     "f215685055a2a920e83bf219c162711d823bfe9e16ed3439194a43557c3122fd"
     "f57351ce9f16ebc7651a1193e9325a59a11e1b6e29b01f12a075facb422046dd"
     "f9482fae63f142e30818508e0763533e87e31443437457c49d0c329efa84f3a8"
+    "f4dcde86abf380b64e9d58f530dbb647a921f7f99b9b4292139c9e142d5cd74d"
+    "f0b021144b0545e84ad43a1d704de349923b904bde80cd891957c1eb00e55eec"
+    "edf9b3d11167bbe3601670c84eae6c799c2479e6121bd1ed812fa98814a0cc3a"
+    "eb6af3becf2b369a5d075dc52ec43a9ce9a6b120e4dbde16d3540f7f44c8edbd"
+    "d717a1f9c02e3eeb0df7fcf5c93335742ac612e46f75ffdf2be4d7cae8a55cbb"
+    # "d2f2df370f86aeb1ff6b061236303177a70477d64fc85c52c2b2dd76aa528b1f"
+    # "8c44bd07536bc84a2563488ed2562b5c6e6acd4c65e075e269ce7e05eb297c60"
 )
 
 echo "========================================"

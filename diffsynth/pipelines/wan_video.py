@@ -259,7 +259,10 @@ class WanVideoPipeline(BasePipeline):
         intrinsics: Optional[torch.Tensor] = None,
         use_prope: bool = False,
         zero_temporal_rope: bool = False,
+        zero_xy_rope: bool = False,
+        aat_frame_attention: bool = False,
         num_latent_frames: Optional[int] = None,
+        transform_once: bool = False,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -298,10 +301,23 @@ class WanVideoPipeline(BasePipeline):
             "intrinsics": intrinsics,
             "use_prope": use_prope,
             "zero_temporal_rope": zero_temporal_rope,
+            "zero_xy_rope": zero_xy_rope,
+            "aat_frame_attention": aat_frame_attention,
             "num_latent_frames": num_latent_frames,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+
+        # Transform-once context K/V cache: computed once (step 0), reused every step.
+        # Only valid without classifier-free guidance (a single forward per step),
+        # since posi/nega would otherwise share one cache. The model_fn fast path
+        # additionally checks the DiT is in input_prefix_attention mode.
+        if transform_once:
+            if cfg_scale != 1.0:
+                print("[transform_once] disabled: requires cfg_scale=1.0 (got "
+                      f"{cfg_scale}); falling back to full recompute each step.")
+            else:
+                inputs_shared["context_cache"] = {}
 
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
@@ -724,14 +740,32 @@ class WanVideoUnit_ImageEmbedderFusedMultipleInput(PipelineUnit):
     def process(self, pipe: WanVideoPipeline, input_image, latents, height, width, tiled, tile_size, tile_stride):
         if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents_multiple:
             return {}
-        pipe.load_models_to_device(self.onload_model_names)
+        # Input-encoder mode: encode the conditioning frames with a SEPARATE
+        # (optionally trainable) VAE copy so a clean gradient can reach the
+        # conditioning "representation encoder", then apply a zero-init MLP
+        # residual. When disabled, behaves exactly as before (frozen main VAE).
+        use_input_encoder = getattr(pipe.dit, "use_input_encoder", False)
+        vae = getattr(pipe, "input_vae", None) if use_input_encoder else None
+        if vae is None:
+            vae = pipe.vae
+            pipe.load_models_to_device(self.onload_model_names)
         zs = []
         for i in range(len(input_image)):
             image = pipe.preprocess_image(input_image[i].resize((width, height))).transpose(0, 1)
-            z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-            latents[:, :, i: i+1] = z
+            z = vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
             zs.append(z)
         zs = torch.concat(zs, dim=2)
+        # Zero-init residual adaptor: z0 -> z0 + MLP(z0) on the clean input latents.
+        if use_input_encoder and getattr(pipe.dit, "input_latent_mlp", None) is not None:
+            # NOTE: VAE.encode(tiled=True) accumulates its output on CPU, so move the
+            # latents to the DiT (MLP) device/dtype before applying the residual adaptor.
+            zs = pipe.dit.input_latent_mlp(zs.to(
+                device=pipe.dit.patch_embedding.weight.device,
+                dtype=pipe.dit.patch_embedding.weight.dtype,
+            ))
+        # Write the (adapted) clean latents into the leading conditioning slots.
+        for i in range(zs.shape[2]):
+            latents[:, :, i: i+1] = zs[:, :, i: i+1].to(latents.dtype)
         # print(f"zs.shape: {zs.shape}")
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frames_latents": zs}
 
@@ -1496,6 +1530,9 @@ def model_fn_wan_video(
     Ks: Optional[torch.Tensor] = None,
     image_hw: Optional[tuple] = None,
     zero_temporal_rope: bool = False,
+    zero_xy_rope: bool = False,
+    aat_frame_attention: bool = False,
+    context_cache: Optional[dict] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1570,9 +1607,15 @@ def model_fn_wan_video(
             t = t_chunks[get_sequence_parallel_rank()]
         t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
     elif dit.seperated_timestep and fuse_vae_embedding_in_latents and dit.fuse_vae_embedding_in_latents_multiple:
+        # Per-token timestep: the leading `num_input` (context) frames are clean
+        # (timestep=0) and only the trailing `num_output` (target) frame(s) get the
+        # sampled denoising timestep. Generalized from a hardcoded 5-context assumption
+        # so it supports arbitrary M-to-N (e.g. 6-to-1) via `num_output_frames`.
+        num_output = kwargs.get("num_output_frames") or 1
+        num_input_ts = latents.shape[2] - num_output
         timestep = torch.concat([
-            torch.zeros((5, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 5, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
+            torch.zeros((num_input_ts, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
+            torch.ones((num_output, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
         ]).flatten()
         # print(timestep.dtype)
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
@@ -1630,6 +1673,34 @@ def model_fn_wan_video(
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+
+    # Input-frame conditioning. Two mutually exclusive modes (both disabled under
+    # sequence parallelism, which chunks the sequence):
+    #   1) per-layer token replacement (dit.per_layer_input_replacement, default):
+    #      capture the fixed, clean input-frame tokens ONCE right after patch
+    #      embedding and re-inject them unchanged before every DiT block, so the
+    #      conditioning is never transformed across layers (true per-layer
+    #      cross-attention).
+    #   2) prefix attention (dit.input_prefix_attention): let the input tokens
+    #      transform through the layers like normal self-attention tokens, but mask
+    #      attention so context tokens attend only to each other. With a fixed
+    #      context timestep (=0) this makes the context a step-invariant clean
+    #      prefix that can be transformed/encoded once at inference.
+    input_tokens_fixed = None
+    input_prefix_attn_mask = None
+    if getattr(dit, "use_input_encoder", False) and not use_unified_sequence_parallel:
+        num_output = kwargs.get("num_output_frames") or 1
+        n_in = (f - num_output) * h * w
+        if getattr(dit, "input_prefix_attention", False):
+            # Boolean (S, S) mask: True = allowed to attend. Context rows (< n_in)
+            # may attend only to context columns; target rows may attend to all.
+            S = f * h * w
+            input_prefix_attn_mask = torch.ones((S, S), dtype=torch.bool, device=x.device)
+            input_prefix_attn_mask[:n_in, n_in:] = False
+            # Broadcast to (1, 1, S, S) for scaled_dot_product_attention.
+            input_prefix_attn_mask = input_prefix_attn_mask.view(1, 1, S, S)
+        elif getattr(dit, "per_layer_input_replacement", True):
+            input_tokens_fixed = x[:, :n_in]
     
     # Reference image
     if reference_latents is not None:
@@ -1640,13 +1711,43 @@ def model_fn_wan_video(
         f += 1
     
     f_freqs = dit.freqs[0][:f]
+    h_freqs = dit.freqs[1][:h]
+    w_freqs = dit.freqs[2][:w]
     if zero_temporal_rope:
         f_freqs = torch.ones_like(f_freqs)
+    if zero_xy_rope:
+        h_freqs = torch.ones_like(h_freqs)
+        w_freqs = torch.ones_like(w_freqs)
     freqs = torch.cat([
         f_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        h_freqs.view(1, h, 1, -1).expand(f, h, w, -1),
+        w_freqs.view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+    # AAT-style alternating attention. When enabled, this path is fully self-contained
+    # and ignores the global zero_temporal_rope / zero_xy_rope masks (which still affect
+    # the legacy `freqs` tensor used by VAP / vace / non-AAT blocks):
+    #   - Even-indexed (frame) blocks: 2D xy RoPE only (within-frame attention),
+    #     temporal slice = identity by construction.
+    #   - Odd-indexed (global) blocks: NO RoPE at all (full 3D joint attention with
+    #     all-identity rotations), so frames and spatial positions are both
+    #     permutation-equivariant in the global pass.
+    freqs_frame = None
+    freqs_no_rope = None
+    if aat_frame_attention:
+        # Use the *raw* h/w freqs so xy RoPE stays real for even blocks regardless of
+        # whether the user also passed --zero_xy_rope (--zero_xy_rope still affects
+        # the legacy `freqs` consumed by VAP / vace, preserving prior behavior).
+        h_freqs_real = dit.freqs[1][:h]
+        w_freqs_real = dit.freqs[2][:w]
+        ones_f_one = torch.ones_like(dit.freqs[0][:1])
+        freqs_frame = torch.cat([
+            ones_f_one.view(1, 1, 1, -1).expand(1, h, w, -1),
+            h_freqs_real.view(1, h, 1, -1).expand(1, h, w, -1),
+            w_freqs_real.view(1, 1, w, -1).expand(1, h, w, -1),
+        ], dim=-1).reshape(h * w, 1, -1).to(x.device)
+        # Odd blocks: all-identity freqs so rope_apply becomes a no-op.
+        freqs_no_rope = torch.ones_like(freqs)
 
     # PRoPE: camera-geometry-aware positional encoding (replaces 3D RoPE when enabled)
     prope_attn = None
@@ -1695,6 +1796,98 @@ def model_fn_wan_video(
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload
         )
     
+    # Transform-once context K/V cache (inference-only fast path). With the prefix
+    # attention mask + per-token timestep (context=0), the context tokens' per-layer
+    # hidden states are identical across all denoising steps, so we transform them
+    # ONCE (prefill, step 0), cache each layer's context K/V, and on later steps
+    # ("decode") run ONLY the target tokens attending to the cached context K/V.
+    if (
+        context_cache is not None
+        and getattr(dit, "input_prefix_attention", False)
+        and getattr(dit, "use_input_encoder", False)
+        and not use_unified_sequence_parallel
+        and vace_context is None and vap is None and pose_latents is None
+        and tea_cache is None and reference_latents is None
+        and dit.seperated_timestep and fuse_vae_embedding_in_latents
+        and dit.fuse_vae_embedding_in_latents_multiple
+    ):
+        num_output = kwargs.get("num_output_frames") or 1
+        n_in = (f - num_output) * h * w
+        if aat_frame_attention:
+            # AAT-aware transform-once. The prefix mask is only meaningful on the
+            # global (odd) blocks, so we cache context K/V ONLY there. Even (frame)
+            # blocks use within-frame attention, which never mixes context and target
+            # anyway, so during decode they can be run on the target frame(s) alone.
+            if not context_cache.get("filled", False):
+                # Prefill: full AAT forward. Even blocks = within-frame (no cache);
+                # odd blocks = global + prefix mask, caching the context K/V.
+                for block_id, block in enumerate(dit.blocks):
+                    if block_id % 2 == 0:
+                        x = block(x, context, t_mod, freqs_frame,
+                                  axis="frame", fhw=(f, h, w))
+                    else:
+                        x = block(x, context, t_mod, freqs_no_rope,
+                                  axis="global", attn_mask=input_prefix_attn_mask,
+                                  ctx_cache=context_cache, cache_key=block_id,
+                                  n_in=n_in, cache_mode="write")
+                context_cache["filled"] = True
+                x = dit.head(x, t)
+                x = dit.unpatchify(x, (f, h, w))
+                return x
+            else:
+                # Decode: run ONLY the target frame(s). Even blocks do within-frame
+                # attention on the target frame; odd blocks attend to the cached
+                # (step-invariant) context K/V.
+                x_t = x[:, n_in:]
+                t_mod_t = t_mod[:, n_in:]
+                t_t = t[:, n_in:]
+                freqs_no_rope_t = freqs_no_rope[n_in:]
+                for block_id, block in enumerate(dit.blocks):
+                    if block_id % 2 == 0:
+                        x_t = block(x_t, context, t_mod_t, freqs_frame,
+                                    axis="frame", fhw=(num_output, h, w))
+                    else:
+                        x_t = block(x_t, context, t_mod_t, freqs_no_rope_t,
+                                    axis="global", attn_mask=None,
+                                    ctx_cache=context_cache, cache_key=block_id,
+                                    n_in=n_in, cache_mode="read")
+                x_t = dit.head(x_t, t_t)
+                x_t = dit.unpatchify(x_t, (num_output, h, w))
+                b_, c_, _, hl_, wl_ = x_t.shape
+                out = torch.zeros((b_, c_, f, hl_, wl_), dtype=x_t.dtype, device=x_t.device)
+                out[:, :, f - num_output:] = x_t
+                return out
+        if not context_cache.get("filled", False):
+            # Prefill: full masked forward, capturing per-layer context K/V.
+            for block_id, block in enumerate(dit.blocks):
+                x = block(x, context, t_mod, freqs, attn_mask=input_prefix_attn_mask,
+                          ctx_cache=context_cache, cache_key=block_id, n_in=n_in, cache_mode="write")
+            context_cache["filled"] = True
+            x = dit.head(x, t)
+            x = dit.unpatchify(x, (f, h, w))
+            return x
+        else:
+            # Decode: only the target tokens flow through the blocks; they attend to
+            # the cached (step-invariant) context K/V. Context output is irrelevant
+            # (the pipeline re-fixes the clean context slots each step), so return a
+            # full-size tensor with only the target frame(s) populated.
+            x_t = x[:, n_in:]
+            freqs_t = freqs[n_in:]
+            t_mod_t = t_mod[:, n_in:]
+            t_t = t[:, n_in:]
+            for block_id, block in enumerate(dit.blocks):
+                x_t = block(x_t, context, t_mod_t, freqs_t, attn_mask=None,
+                            ctx_cache=context_cache, cache_key=block_id, n_in=n_in, cache_mode="read")
+            x_t = dit.head(x_t, t_t)
+            x_t = dit.unpatchify(x_t, (num_output, h, w))
+            # x_t: (B, out_dim, num_output, H_lat, W_lat). Scatter into a full-length
+            # tensor at the trailing target frame slots (context slots are irrelevant;
+            # the pipeline re-fixes the clean context latents after each step).
+            b_, c_, _, hl_, wl_ = x_t.shape
+            out = torch.zeros((b_, c_, f, hl_, wl_), dtype=x_t.dtype, device=x_t.device)
+            out[:, :, f - num_output:] = x_t
+            return out
+
     # blocks
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -1705,9 +1898,9 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
-        def create_custom_forward(module, _prope_attn=None):
+        def create_custom_forward(module, _prope_attn=None, _axis="global", _fhw=None, _attn_mask=None):
             def custom_forward(*inputs):
-                return module(*inputs, prope_attn=_prope_attn)
+                return module(*inputs, axis=_axis, fhw=_fhw, prope_attn=_prope_attn, attn_mask=_attn_mask)
             return custom_forward
         
         def create_custom_forward_vap(block, vap):
@@ -1715,9 +1908,52 @@ def model_fn_wan_video(
                 return vap(block, *inputs)
             return custom_forward
         
+        _aat_vap_warned = False
         for block_id, block in enumerate(dit.blocks):
+            # Per-layer token replacement: re-inject the fixed clean input-frame
+            # tokens before every block so they are never transformed across layers
+            # (true cross-attention). The target token reads them via self-attention;
+            # the input positions' block outputs are overwritten here each iteration.
+            if input_tokens_fixed is not None:
+                _n_in = input_tokens_fixed.shape[1]
+                x = torch.cat([input_tokens_fixed, x[:, _n_in:]], dim=1)
+            # Decide attention mode for this block. When aat_frame_attention is on:
+            #   - even-indexed blocks (0, 2, 4, ...) -> within-frame attention with 2D xy RoPE
+            #   - odd-indexed  blocks (1, 3, 5, ...) -> full 3D global attention with NO RoPE
+            # When AAT is off: every block uses the legacy `freqs` (which respects
+            # zero_temporal_rope / zero_xy_rope), exactly as before.
+            #
+            # The input-encoder prefix mask (if any) is applied PER BLOCK:
+            #   - even/within-frame blocks: NO mask. Within-frame attention already
+            #     prevents any cross-frame leakage (context frames cannot see the
+            #     target), and axis='frame' does not support an attn_mask anyway.
+            #   - odd/global blocks (and every block when AAT is off): apply the
+            #     prefix mask so context tokens attend only to context across frames,
+            #     keeping the context a clean, step-invariant prefix even through
+            #     AAT's global passes.
+            if aat_frame_attention:
+                use_frame = (block_id % 2 == 0)
+                if use_frame:
+                    block_freqs = freqs_frame
+                    block_axis = "frame"
+                    block_fhw = (f, h, w)
+                    block_attn_mask = None
+                else:
+                    block_freqs = freqs_no_rope
+                    block_axis = "global"
+                    block_fhw = None
+                    block_attn_mask = input_prefix_attn_mask
+            else:
+                use_frame = False
+                block_freqs = freqs
+                block_axis = "global"
+                block_fhw = None
+                block_attn_mask = input_prefix_attn_mask
             # Block
             if vap is not None and block_id in vap.mot_layers_mapping:
+                if use_frame and not _aat_vap_warned:
+                    print(f"[AAT] Warning: block {block_id} is both VAP-mapped and AAT even-indexed; VAP path takes precedence (AAT disabled for this block).")
+                    _aat_vap_warned = True
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x, x_vap = torch.utils.checkpoint.checkpoint(
@@ -1737,18 +1973,18 @@ def model_fn_wan_video(
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block, prope_attn),
-                            x, context, t_mod, freqs,
+                            create_custom_forward(block, prope_attn, block_axis, block_fhw, block_attn_mask),
+                            x, context, t_mod, block_freqs,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block, prope_attn),
-                        x, context, t_mod, freqs,
+                        create_custom_forward(block, prope_attn, block_axis, block_fhw, block_attn_mask),
+                        x, context, t_mod, block_freqs,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(x, context, t_mod, freqs, prope_attn=prope_attn)
+                    x = block(x, context, t_mod, block_freqs, axis=block_axis, fhw=block_fhw, prope_attn=prope_attn, attn_mask=block_attn_mask)
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:

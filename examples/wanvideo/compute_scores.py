@@ -35,6 +35,8 @@ import torch
 # ──────────────────────────────────────────────────────────────────────────────
 # DEFAULT_MODEL_H = 480
 # DEFAULT_MODEL_W = 832
+# DEFAULT_MODEL_H = 704
+# DEFAULT_MODEL_W = 1280
 # DEFAULT_EVAL_SIZE = 480
 DEFAULT_MODEL_H = 192
 DEFAULT_MODEL_W = 336

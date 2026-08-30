@@ -1,12 +1,18 @@
 #!/bin/bash
 
-# Wan2.1 6-to-1 NVS evaluation on mip-NeRF 360 scenes
-# 7 scenes distributed across 3 GPUs (round-robin)
+# Wan2.1 M-to-1 NVS evaluation on mip-NeRF 360 scenes
+# 7 scenes distributed across GPUs (round-robin)
+#
+# Usage:
+#   bash test_wan2.1_mip360_parallel.sh          # 6-to-1 (default)
+#   bash test_wan2.1_mip360_parallel.sh 3         # 3-to-1
+
+NUM_INPUT="${1:-3}"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
-output_path="/data2/qiwu2/mip360_test_results_wan21_6to1_zero-temporal-rope-480p_epoch-59"
-GPU_IDS=( 0 1 2 3 4 5 6)
+checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-zero-temporal-rope_T10_480p/epoch-29.safetensors"
+output_path="/data2/qiwu2/mip360_test_results_wan21_${NUM_INPUT}to1_zero-temporal-rope_T10_480p_epoch-29"
+GPU_IDS=( 1 2 3 4 5 6 7)
 
 SCENES=(
     "bicycle"
@@ -19,7 +25,7 @@ SCENES=(
 )
 
 echo "========================================"
-echo "Wan2.1 6-to-1 NVS - mip-NeRF 360 Evaluation (Parallel)"
+echo "Wan2.1 ${NUM_INPUT}-to-1 NVS - mip-NeRF 360 Evaluation (Parallel)"
 echo "========================================"
 echo "Checkpoint: $checkpoint_path"
 echo "Output path: $output_path"
@@ -53,6 +59,7 @@ for g in "${!GPU_IDS[@]}"; do
                 --checkpoint_path $checkpoint_path \
                 --output_path $output_path \
                 --scenes $scene \
+                --num_input_frames $NUM_INPUT \
                 --use_dreamsim \
                 --use_ssim \
                 --use_lpips \

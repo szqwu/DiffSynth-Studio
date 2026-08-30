@@ -1,23 +1,21 @@
 #!/bin/bash
 
-# Script to run Wan2.1 M-to-N NVS evaluation on DL3DV-10K scenes
-# Processes scenes in parallel across 5 GPUs, 2 scenes per GPU
+# Script to run Wan2.1-T2V-1.3B M-to-N NVS evaluation on DL3DV-10K scenes
+# Processes scenes in parallel across 5 GPUs, 2 scenes per GPU.
+# Mirrors test_wan2.1_6to1_parallel.sh, but invokes the T2V-1.3B variant of
+# the test script (test_wan2.1_t2v_1_3b_6to1.py) and points at the 1.3B
+# checkpoint produced by Wan2.1-SE-ZeroTemporalRoPE-T2V-1.3B.sh.
 
 # ── M-to-N configuration ──────────────────────────────────────────────────────
 NUM_INPUT_FRAMES="${1:-6}"
 NUM_OUTPUT_FRAMES="${2:-1}"
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-# checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-prob_random_480p_resume_from_192p/epoch-69-new.safetensors"
-# output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_480p_resume_from_192p_epoch-69-new"
-# checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_zero-temporal-rope-480p/epoch-59.safetensors"
-# output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope-480p_epoch-59-step-10"
-checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-zero-temporal-rope_T10_480p/epoch-29.safetensors"
-output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope_T10_480p_epoch-29-step-5"
-# checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-aat-frame-attn2/epoch-96.safetensors"
-# output_path="/data2/qiwu2/dl3dv_test_results_wan21_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_aat-frame-attn2_epoch-160"
-GPU_IDS=(3 4 5 6 7)
-# GPU_IDS=(  7 )
+# ── Configuration ─────────────────────────────────────────────────────────────
+checkpoint_path="./models/train/Wan2.1-SE-T2V-1.3B-lora512-zero-temporal-rope-480p-T10/epoch-19.safetensors"
+output_path="/data2/qiwu2/dl3dv_test_results_wan21_t2v_1_3b_${NUM_INPUT_FRAMES}to${NUM_OUTPUT_FRAMES}_zero-temporal-rope_epoch-480p-T10-19"
+
+GPU_IDS=(0 1 2 3 4)
+# GPU_IDS=( 7 )
 SCENES_PER_GPU=2
 
 # All 10 DL3DV-10K test scenes
@@ -35,7 +33,7 @@ SCENES=(
 )
 
 echo "========================================"
-echo "Wan2.1 ${NUM_INPUT_FRAMES}-to-${NUM_OUTPUT_FRAMES} NVS - DL3DV-10K Evaluation (Parallel)"
+echo "Wan2.1-T2V-1.3B ${NUM_INPUT_FRAMES}-to-${NUM_OUTPUT_FRAMES} NVS - DL3DV-10K Evaluation (Parallel)"
 echo "========================================"
 echo "Checkpoint: $checkpoint_path"
 echo "Output path: $output_path"
@@ -60,7 +58,7 @@ for i in "${!GPU_IDS[@]}"; do
 
     echo "[GPU $gpu_id] Processing scenes: ${gpu_scenes[*]:0:1}... (${#gpu_scenes[@]} total)"
 
-    CUDA_VISIBLE_DEVICES=$gpu_id python test_wan2.1_6to1.py \
+    CUDA_VISIBLE_DEVICES=$gpu_id python test_wan2.1_t2v_1_3b_6to1.py \
         --checkpoint_path $checkpoint_path \
         --output_path $output_path \
         --scenes ${gpu_scenes[@]} \
@@ -74,7 +72,7 @@ for i in "${!GPU_IDS[@]}"; do
         --width 832 \
         --eval_size 480 \
         --zero_temporal_rope \
-        --num_inference_steps 5 \
+        --num_inference_steps 50 \
         > >(while read line; do echo "[GPU $gpu_id] $line"; done) \
         2>&1 &
 

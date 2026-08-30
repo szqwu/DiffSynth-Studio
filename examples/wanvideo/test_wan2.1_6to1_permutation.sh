@@ -26,11 +26,12 @@ elif [ "$MODE" = "zero_temporal_rope" ]; then
     output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_79_2_permtest${NOISE_SUFFIX}"
     EXTRA_ARGS="--zero_temporal_rope"
 else
-    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-6to1_sorted_context/epoch-79.safetensors"
-    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_sorted_context_79_permtest${NOISE_SUFFIX}"
-    EXTRA_ARGS=""
+    checkpoint_path="./models/train/Wan2.1-SE-14B-lora32-zero-temporal-rope_camera-first-origin/epoch-79.safetensors"
+    output_path="/data2/qiwu2/dl3dv_test_results_wan21_6to1_zero-temporal-rope_camera-first-origin_79_permtest${NOISE_SUFFIX}"
+    # EXTRA_ARGS=""
+    EXTRA_ARGS="--zero_temporal_rope"
 fi
-GPU_ID=7
+GPU_ID=1
 
 # All 10 DL3DV-10K test scenes
 SCENES=(

@@ -22,6 +22,7 @@ from diffsynth.models.wan_video_dit import WanModel
 from diffsynth.core.data.my_v2v_dataset_images_in_plucker_SE import (
     get_plucker_rays,
     normalize_w2c_make_cam_last_origin,
+    normalize_w2c_make_cam0_origin,
 )
 
 
@@ -194,7 +195,9 @@ def prepare_raymap(extrinsics, intrinsics, context_indices, target_indices, heig
     intrinsics_cat = np.concatenate([context_intrinsics, target_intrinsics], axis=0)
     intrinsics_tensor = torch.from_numpy(intrinsics_cat).float()
 
-    _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
+    # _, camera_poses_norm, _ = normalize_w2c_make_cam_last_origin(w2cs)
+    _, camera_poses_norm, _ = normalize_w2c_make_cam0_origin(w2cs)
+    print("camera first origin")
 
     raymap = get_plucker_rays(
         camera_poses_norm,
